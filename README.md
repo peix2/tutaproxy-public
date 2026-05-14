@@ -36,7 +36,7 @@ Tuta is a privacy-focused email service with strong end-to-end encryption. It on
 ## Quick Start — Docker
 
 ```bash
-git clone https://github.com/yourname/tuta-proxy.git
+git clone https://github.com/peix2/tuta-proxy.git
 cd tuta-proxy/docker
 docker-compose up -d --build
 ```
@@ -52,7 +52,7 @@ Cache is stored in a Docker volume and survives container restarts.
 ## Quick Start — Python
 
 ```bash
-git clone https://github.com/yourname/tuta-proxy.git
+git clone https://github.com/peix2/tuta-proxy.git
 cd tuta-proxy
 python3 -m venv .venv
 source .venv/bin/activate
