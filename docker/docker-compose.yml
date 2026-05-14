@@ -1,0 +1,15 @@
+services:
+  tutaproxy:
+    build:
+      context: ..          # katalog projektu (gdzie jest requirements.txt, tuta/, run_proxy.py)
+      dockerfile: docker/Dockerfile
+    image: tutaproxy:latest
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:1143:1143"   # IMAP — tylko localhost hosta, nie z sieci
+      - "127.0.0.1:1025:1025"   # SMTP — tylko localhost hosta, nie z sieci
+    volumes:
+      - tuta_cache:/data
+
+volumes:
+  tuta_cache:

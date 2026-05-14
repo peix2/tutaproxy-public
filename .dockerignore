@@ -1,0 +1,17 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.db
+*.db-shm
+*.db-wal
+*.log
+.env
+node_modules/
+package.json
+package-lock.json
+test_*.py
+debug_*.py
+*.js
+docker/
+README.md

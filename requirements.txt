@@ -1,0 +1,6 @@
+aiohttp==3.13.5
+aiosmtpd==1.4.6
+argon2-cffi==25.1.0
+cryptography==44.0.3
+kyber-py==1.2.0
+lz4==4.4.5

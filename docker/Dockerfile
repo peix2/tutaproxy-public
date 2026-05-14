@@ -1,0 +1,28 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Zależności systemowe wymagane przez cryptography i lz4
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        gcc \
+        libffi-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY tuta/ ./tuta/
+COPY run_proxy.py .
+
+RUN mkdir -p /data
+
+EXPOSE 1143 1025
+
+ENV TUTA_IMAP_HOST=0.0.0.0 \
+    TUTA_IMAP_PORT=1143 \
+    TUTA_SMTP_HOST=0.0.0.0 \
+    TUTA_SMTP_PORT=1025 \
+    TUTA_CACHE_PATH=/data/tuta_cache.db \
+    LOG_LEVEL=INFO
+
+CMD ["python", "run_proxy.py"]
