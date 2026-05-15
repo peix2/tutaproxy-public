@@ -76,6 +76,10 @@ python run_smtp.py
 | `TUTA_SMTP_PORT` | `1025` | SMTP port |
 | `TUTA_CACHE_PATH` | `tuta_cache.db` | SQLite cache file path |
 | `LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR` |
+| `TUTA_SYS_VERSION` | `150` | Tuta sys model version (override after API update) |
+| `TUTA_TUTANOTA_VERSION` | `108` | Tuta tutanota model version |
+| `TUTA_STORAGE_VERSION` | `14` | Tuta storage model version |
+| `TUTA_CLIENT_VERSION` | `346.260428.0` | Tuta client version string |
 
 ---
 
@@ -151,8 +155,15 @@ The proxy implements Tuta's REST API, including the end-to-end encryption layer 
 
 ---
 
+## If you like it
+
+Feel free to express it by donation in Monero (XMR): 88dSpPtjYmKifkaMQ9Nm7ogD1ZRrk7gdxTp6m8DQEPU5TFoQcDGfED8GfZDVNohqjogZSjFMwa6oY59CDbPTad5TNfwVBTk
+
+---
+
 ## License
 
 AGPL v3. See [LICENSE](LICENSE).
 
 This project is not affiliated with Tutanota GmbH. The Tuta API is used solely for personal interoperability purposes.
+

@@ -10,6 +10,13 @@ services:
       - "127.0.0.1:1025:1025"   # SMTP — tylko localhost hosta, nie z sieci
     volumes:
       - tuta_cache:/data
+    environment:
+      LOG_LEVEL: INFO
+      # Gdy Tuta zbumpuje wersję API, nadpisz tu bez przebudowania obrazu:
+      # TUTA_SYS_VERSION: "150"
+      # TUTA_TUTANOTA_VERSION: "108"
+      # TUTA_STORAGE_VERSION: "14"
+      # TUTA_CLIENT_VERSION: "346.260428.0"
 
 volumes:
   tuta_cache:

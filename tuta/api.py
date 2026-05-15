@@ -57,15 +57,19 @@ logger = logging.getLogger(__name__)
 
 TUTA_BASE_URL = "https://app.tuta.com"
 
-# Wersje modeli (ustalone z type_models/*.json w repo tutanota, maj 2026)
-SYS_MODEL_VERSION = "150"
-TUTANOTA_MODEL_VERSION = "108"
+# Wersje modeli — nadpisywalne przez zmienne środowiskowe.
+# Gdy Tuta zbumpuje wersję, ustaw TUTA_SYS_VERSION / TUTA_TUTANOTA_VERSION / TUTA_CLIENT_VERSION
+# bez zmiany kodu. Proxy wykryje niezgodność wersji i zaloguje ostrzeżenie.
+SYS_MODEL_VERSION     = os.environ.get("TUTA_SYS_VERSION",      "150")
+TUTANOTA_MODEL_VERSION = os.environ.get("TUTA_TUTANOTA_VERSION", "108")
+STORAGE_MODEL_VERSION  = os.environ.get("TUTA_STORAGE_VERSION",  "14")
+CLIENT_VERSION         = os.environ.get("TUTA_CLIENT_VERSION",   "346.260428.0")
 
 # Nagłówki dla endpointów sys
 TUTA_HEADERS = {
     "v": SYS_MODEL_VERSION,
     "cp": "5",
-    "cv": "346.260428.0",
+    "cv": CLIENT_VERSION,
     "Content-Type": "application/json",
     "Accept": "application/json",
 }
@@ -74,7 +78,7 @@ TUTA_HEADERS = {
 TUTANOTA_HEADERS = {
     "v": TUTANOTA_MODEL_VERSION,
     "cp": "5",
-    "cv": "346.260428.0",
+    "cv": CLIENT_VERSION,
     "Content-Type": "application/json",
     "Accept": "application/json",
 }
@@ -154,6 +158,25 @@ class TutaClient:
             path += f"/{i}"
         return self.base_url + path
 
+    @staticmethod
+    def _check_version_mismatch(status: int, body: str) -> None:
+        """Loguje ostrzeżenie jeśli błąd wygląda na niezgodność wersji modelu API."""
+        is_mismatch = (
+            status == 412
+            or (status in (400, 500) and any(
+                kw in body.lower() for kw in ("model", "version", "outdated", "incompatible")
+            ))
+        )
+        if is_mismatch:
+            logger.warning(
+                "Możliwa niezgodność wersji API Tuty (HTTP %d). "
+                "Aktualne wersje: sys=%s tutanota=%s storage=%s client=%s. "
+                "Ustaw TUTA_SYS_VERSION / TUTA_TUTANOTA_VERSION / TUTA_CLIENT_VERSION "
+                "lub zaktualizuj proxy.",
+                status, SYS_MODEL_VERSION, TUTANOTA_MODEL_VERSION,
+                STORAGE_MODEL_VERSION, CLIENT_VERSION,
+            )
+
     async def _get(self, url: str, token: str = "", params: dict = None) -> Any:
         """GET dla endpointów sys (v=150)."""
         headers = {"accessToken": token} if token else {}
@@ -161,6 +184,7 @@ class TutaClient:
             if r.status == 200:
                 return await r.json(content_type=None)
             body = await r.text()
+            self._check_version_mismatch(r.status, body)
             raise TutaAPIError(r.status, body)
 
     async def _get_tutanota(self, url: str, token: str, params: dict = None) -> Any:
@@ -173,6 +197,7 @@ class TutaClient:
             if r.status == 200:
                 return await r.json(content_type=None)
             body = await r.text()
+            self._check_version_mismatch(r.status, body)
             raise TutaAPIError(r.status, body)
 
     async def _post(self, url: str, body: dict, token: str = "") -> Any:
@@ -181,6 +206,7 @@ class TutaClient:
             if r.status in (200, 201):
                 return await r.json(content_type=None)
             text = await r.text()
+            self._check_version_mismatch(r.status, text)
             raise TutaAPIError(r.status, text)
 
     async def _delete(self, url: str, token: str) -> None:
@@ -188,7 +214,9 @@ class TutaClient:
             url, headers={"accessToken": token}
         ) as r:
             if r.status not in (200, 204):
-                raise TutaAPIError(r.status, await r.text())
+                body = await r.text()
+                self._check_version_mismatch(r.status, body)
+                raise TutaAPIError(r.status, body)
 
     # -----------------------------------------------------------------------
     # Login
@@ -607,9 +635,9 @@ class TutaClient:
         }
         headers = {
             "accessToken": session.access_token,
-            "v": "14",  # storage model version
+            "v": STORAGE_MODEL_VERSION,
             "cp": "5",
-            "cv": "346.260428.0",
+            "cv": CLIENT_VERSION,
             "Content-Type": "application/json",
             "Accept": "application/json",
         }
@@ -760,7 +788,7 @@ class TutaClient:
 
         token_headers = {
             "accessToken": session.access_token,
-            "v": "14",
+            "v": STORAGE_MODEL_VERSION,
             "Content-Type": "application/json",
         }
 
@@ -875,7 +903,7 @@ class TutaClient:
             async with self._http.request(
                 "GET",
                 f"{server_url}/rest/storage/blobservice",
-                headers={"Content-Type": "application/json", "v": "14"},
+                headers={"Content-Type": "application/json", "v": STORAGE_MODEL_VERSION},
                 params=params,
                 data=_json.dumps(blob_get_in).encode("utf-8"),
             ) as r:
@@ -973,7 +1001,7 @@ class TutaClient:
         ws_url = (
             TUTA_BASE_URL.replace("https://", "wss://")
             + f"/event?modelVersions={SYS_MODEL_VERSION}.{TUTANOTA_MODEL_VERSION}"
-            f"&clientVersion=346.260428.0"
+            f"&clientVersion={CLIENT_VERSION}"
             f"&userId={session.user_id}"
             f"&accessToken={session.access_token}"
         )
@@ -1472,7 +1500,7 @@ class TutaClient:
         }
         headers = {
             "accessToken": session.access_token,
-            "v": "14",
+            "v": STORAGE_MODEL_VERSION,
             "Content-Type": "application/json",
         }
         async with self._http.post(
@@ -1542,7 +1570,7 @@ class TutaClient:
             f"{server_url}/rest/storage/blobservice",
             params=params,
             data=encrypted_data,
-            headers={"Content-Type": "application/octet-stream", "v": "14"},
+            headers={"Content-Type": "application/octet-stream", "v": STORAGE_MODEL_VERSION},
         ) as r:
             if r.status not in (200, 201):
                 resp_text = await r.text()
