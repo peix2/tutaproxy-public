@@ -20,8 +20,10 @@ Nie obsługujemy (M4+):
 
 import asyncio
 import base64
+import hashlib
 import logging
 import re
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional
@@ -97,6 +99,40 @@ def _rfc2822_body_html(msg) -> str:
     return text
 
 
+def _rfc2822_attachments(msg) -> "list[tuple[str, str, str | None, bytes]]":
+    """
+    Wyciąga załączniki z wiadomości RFC 2822.
+    Zwraca listę (filename, mime_type, content_id_or_None, data).
+    Pomija części text/html i text/plain bez Content-Disposition: attachment.
+    """
+    if not msg.is_multipart():
+        return []
+    _EXT = {
+        "image/png": "png", "image/jpeg": "jpg", "image/gif": "gif",
+        "image/webp": "webp", "application/pdf": "pdf",
+    }
+    result = []
+    for part in msg.walk():
+        ct = part.get_content_type()
+        disp = str(part.get("Content-Disposition", "")).lower()
+        if ct in ("text/html", "text/plain") and "attachment" not in disp:
+            continue
+        if ct.startswith("multipart/"):
+            continue
+        data = part.get_payload(decode=True)
+        if data is None:
+            continue
+        raw_name = part.get_filename() or ""
+        filename = _rfc2822_header(raw_name) if raw_name else ""
+        if not filename:
+            ext = _EXT.get(ct, "bin")
+            filename = f"attachment.{ext}"
+        cid_raw = part.get("Content-ID", "").strip()
+        cid = cid_raw.strip("<>") if cid_raw else None
+        result.append((filename, ct or "application/octet-stream", cid, data))
+    return result
+
+
 FOLDER_TYPE_NAMES = {
     "1": "INBOX",
     "2": "Sent",
@@ -163,11 +199,14 @@ class IMAPConnection:
         writer: asyncio.StreamWriter,
         client: TutaClient,
         cache: TutaCache,
+        append_dedup: "dict[tuple[str, str], float] | None" = None,
     ):
         self.reader = reader
         self.writer = writer
         self.client = client
         self.cache = cache
+        # Współdzielony słownik deduplikacji APPEND (przekazany z IMAPServer)
+        self._append_dedup: "dict[tuple[str, str], float]" = append_dedup if append_dedup is not None else {}
 
         self.state = "NOT_AUTH"
         self.session: Optional[Session] = None
@@ -179,6 +218,9 @@ class IMAPConnection:
         # Unikamy przebudowy dla każdego partial fetch (BODY[]<offset.count>),
         # co gwarantuje też stałe granice MIME między żądaniami.
         self._msg_cache: dict[str, bytes] = {}
+        # Maile z null _ownerEncSessionKey podczas IDLE — element_id → (list_id, element_id).
+        # Retry przy NOOP gdy serwer Tuty skończy asynchroniczne szyfrowanie.
+        self._pending_mail_ids: dict[str, tuple[str, str]] = {}
 
         peer = writer.get_extra_info("peername")
         self.peer = f"{peer[0]}:{peer[1]}" if peer else "unknown"
@@ -329,6 +371,23 @@ class IMAPConnection:
         self._ok(tag, "CAPABILITY completed")
 
     async def _cmd_noop(self, tag: str, args: str) -> None:
+        if self.state == "SELECTED" and self.mailbox and self._pending_mail_ids and self.session:
+            resolved = []
+            for elem_id, (list_id, _) in list(self._pending_mail_ids.items()):
+                try:
+                    mail_raw = await self.client.get_single_mail(self.session, list_id, elem_id)
+                    if mail_raw and self._is_mail_decryptable(mail_raw):
+                        if self._insert_mail_raw(mail_raw):
+                            logger.info(f"[{self.peer}] NOOP: mail {elem_id} gotowy po retry, wstrzyknięto")
+                        resolved.append(elem_id)
+                except Exception as e:
+                    logger.debug(f"[{self.peer}] NOOP pending retry {elem_id}: {e}")
+            for eid in resolved:
+                del self._pending_mail_ids[eid]
+            if resolved:
+                self._untagged(f"{self.mailbox.exists} EXISTS")
+                self._untagged("0 RECENT")
+                await self.writer.drain()
         self._ok(tag, "NOOP completed")
 
     async def _cmd_logout(self, tag: str, args: str) -> None:
@@ -616,13 +675,8 @@ class IMAPConnection:
             self._no(tag, f"[NONEXISTENT] Mailbox not found: {mailbox_name}")
             return
 
-        # Reuse cached messages if this is the currently selected mailbox
-        if self.mailbox and self.mailbox.folder.id == target.id:
-            mails = self.mailbox.messages
-        else:
-            mails = await self.client.get_mails_in_folder(
-                self.session, target.mail_list_id
-            )
+        # Zawsze pobierz aktualną listę — stale cache ukrywa nową pocztę przed Thunderbirdem.
+        mails = await self.client.get_mails_in_folder(self.session, target.mail_list_id)
 
         msg_count = len(mails)
         unseen = sum(1 for mail in mails if mail.get("109", "1") == "1")
@@ -808,16 +862,42 @@ class IMAPConnection:
         self._send(f"* {seq} FETCH ({' '.join(response_parts)})")
 
     def _decrypt_mail_key(self, mail_raw: dict) -> bytes:
-        """Odszyfrowuje klucz sesji maila lokalnie (bez API call)."""
+        """
+        Odszyfrowuje klucz sesji maila lokalnie (bez API call).
+
+        Dwie ścieżki:
+          - Pole 102 (_ownerEncSessionKey): standardowy path, decrypt_mail_session_key.
+          - Pole 1310 (internalRecipientKeyData): TutaCrypt PQ decapsulation.
+        """
         import base64 as _b64
-        from .crypto import decrypt_mail_session_key
-        # "or" zamiast get default — pole może być w dict z wartością None (JSON null)
+        from .crypto import decrypt_mail_session_key, pq_decapsulate_bucket_key, aes_decrypt_tuta
+
         enc_sk_b64 = mail_raw.get("102") or ""
-        if not enc_sk_b64:
-            mid = mail_raw.get("99", "?")
-            raise ValueError(f"Brak _ownerEncSessionKey (pole 102) w mailu {mid}")
-        enc_sk = _b64.b64decode(enc_sk_b64)
-        return decrypt_mail_session_key(self.mailbox.mail_group_key, enc_sk)
+        if enc_sk_b64:
+            return decrypt_mail_session_key(self.mailbox.mail_group_key, _b64.b64decode(enc_sk_b64))
+
+        # TutaCrypt PQ path — pole 102 jest null dla Tuta→Tuta E2E
+        field_1310 = mail_raw.get("1310") or []
+        sess = self.session
+        if field_1310 and sess and sess.priv_ecc and sess.kyber_sk:
+            try:
+                entry = field_1310[0] if isinstance(field_1310, list) else field_1310
+                pq_msg = _b64.b64decode(entry.get("2045", ""))
+                bucket_key = pq_decapsulate_bucket_key(
+                    sess.priv_ecc, sess.pub_ecc, sess.pub_kyber_tuta, sess.kyber_sk, pq_msg
+                )
+                mail_id = mail_raw.get("99", ["", ""])
+                mail_elem_id = mail_id[1] if isinstance(mail_id, list) and len(mail_id) > 1 else str(mail_id)
+                for e in (entry.get("2048") or []):
+                    if e.get("2041") == mail_elem_id:
+                        sk = aes_decrypt_tuta(bucket_key, _b64.b64decode(e["2042"]))
+                        logger.debug("TutaCrypt PQ resolved dla maila %s", mail_raw.get("99", "?"))
+                        return sk
+                logger.warning("Brak pasującego elemId %s w 1310[0]['2048']", mail_elem_id)
+            except Exception as e:
+                logger.warning("PQ decaps failed dla %s: %s", mail_raw.get("99", "?"), e)
+
+        raise ValueError(f"Brak klucza sesji w mailu {mail_raw.get('99', '?')}")
 
     def _get_quick_headers(self, mail_raw: dict) -> bytes:
         """
@@ -1055,13 +1135,25 @@ class IMAPConnection:
                 target_folder = f
                 break
 
-        if target_folder is None or target_folder.folder_type != "6":
-            # Nie-Drafts lub nieznany folder — odrzuć dane (Sent zarządzany przez Tuta)
-            logger.info(f"[{self.peer}] APPEND {mailbox_name!r} {literal_size}B — odrzucono")
+        if target_folder is None:
+            logger.info(f"[{self.peer}] APPEND {mailbox_name!r} {literal_size}B — nieznany folder, odrzucono")
             self._ok(tag, "APPEND completed")
             return
 
-        # ── Drafts: utwórz draft przez Tuta API ──
+        folder_type = target_folder.folder_type
+
+        if folder_type == "2":
+            # Sent — Tuta zarządza kopią wysłanej automatycznie po senddraftservice
+            logger.info(f"[{self.peer}] APPEND Sent {literal_size}B — odrzucono")
+            self._ok(tag, "APPEND completed")
+            return
+
+        if folder_type != "6":
+            # Inbox, Archive, Spam, custom — wyślij do siebie, mail trafi do Inbox
+            await self._append_send_to_self(tag, raw, mail_group_key, mailbox_name)
+            return
+
+        # ── Drafts (folder_type == "6"): utwórz draft przez Tuta API ──
         if mail_group_key is None:
             self._no(tag, "APPEND: brak klucza grupy mail")
             return
@@ -1110,6 +1202,129 @@ class IMAPConnection:
                 logger.warning(f"[{self.peer}] APPEND: nie można pobrać nowego draftu: {e}")
 
         self._ok(tag, f"[APPENDUID {uv} {uid}] APPEND completed")
+
+    async def _append_send_to_self(
+        self, tag: str, raw: bytes, mail_group_key: bytes, mailbox_name: str
+    ) -> None:
+        """
+        APPEND do folderu innego niż Drafts/Sent — wysyła wiadomość do samego siebie,
+        żeby trafiła do Inbox jako zaszyfrowana wiadomość Tuta.
+
+        Ograniczenie: mail zawsze ląduje w Inbox (Tuta API nie pozwala wstrzyknąć maila
+        bezpośrednio do dowolnego folderu). From: senderName = oryginalne From z nagłówka.
+        """
+        # Deduplikacja: ten sam klient (Thunderbird) może wysłać APPEND dwa razy
+        # z dwóch połączeń równocześnie (różne połączenia, ta sama treść).
+        # Pomijamy duplikat jeśli ta sama treść była już przetworzona w ciągu 15 sekund.
+        _DEDUP_TTL = 15.0
+        now = time.monotonic()
+        user_key = self.session.user_email if self.session else ""
+        content_hash = hashlib.sha256(raw).hexdigest()
+        dedup_key = (user_key, content_hash)
+
+        # Wyczyść stare wpisy (async single-threaded — brak race condition)
+        expired = [k for k, t in self._append_dedup.items() if now - t >= _DEDUP_TTL]
+        for k in expired:
+            del self._append_dedup[k]
+
+        if dedup_key in self._append_dedup:
+            logger.info(
+                "[%s] APPEND %r — zduplikowany APPEND (hash=%s…), pomijam",
+                self.peer, mailbox_name, content_hash[:8],
+            )
+            self._ok(tag, "APPEND completed")
+            return
+
+        self._append_dedup[dedup_key] = now
+
+        msg = _email_from_bytes(raw)
+        subject = _rfc2822_header(msg.get("Subject", ""))
+        from_parsed = _rfc2822_addrs(_rfc2822_header(msg.get("From", "")))
+        orig_name, orig_addr = from_parsed[0] if from_parsed else ("", "")
+        # Zachowaj oryginalnego nadawcę jako senderName — widoczny w liście maili Tuty
+        sender_name = orig_name or orig_addr or self.session.user_email
+        body_html = _rfc2822_body_html(msg)
+        raw_attachments = _rfc2822_attachments(msg)
+
+        try:
+            # Upload załączników przed create_draft — każdy zwraca (DraftAttachment, file_sk)
+            uploaded: list[tuple[dict, bytes]] = []
+            for fname, fmime, fcid, fdata in raw_attachments:
+                da, file_sk = await self.client.upload_attachment(
+                    session=self.session,
+                    mail_group_key=mail_group_key,
+                    data=fdata,
+                    filename=fname,
+                    mime_type=fmime,
+                    cid=fcid,
+                )
+                uploaded.append((da, file_sk))
+                logger.debug(
+                    "[%s] APPEND: załącznik uploadowany: %r %dB", self.peer, fname, len(fdata)
+                )
+
+            draft_list_id, draft_elem_id, sk = await self.client.create_draft(
+                session=self.session,
+                subject=subject,
+                body_html=body_html,
+                from_addr=self.session.user_email,
+                from_name=sender_name,
+                to_recipients=[(self.session.user_email, self.session.user_email)],
+                cc_recipients=[],
+                bcc_recipients=[],
+                mail_group_key=mail_group_key,
+                attachments=[da for da, _ in uploaded],
+            )
+
+            # Pobierz ID plików przyznane przez serwer (pole 115 draftu)
+            attachment_keys: list[tuple[str, str, bytes]] = []
+            if uploaded:
+                file_ids = await self.client.get_draft_file_ids(
+                    self.session, draft_list_id, draft_elem_id
+                )
+                attachment_keys = [
+                    (flist_id, felem_id, file_sk)
+                    for (flist_id, felem_id), (_, file_sk) in zip(file_ids, uploaded)
+                ]
+
+            # Wyślij E2E do siebie jeśli klucze PQ dostępne, inaczej non-confidential
+            sess = self.session
+            if sess.priv_ecc and sess.kyber_sk:
+                pub_key = await self.client.get_recipient_public_key(
+                    sess.user_email, sess.access_token
+                )
+                if pub_key:
+                    await self.client.send_draft_e2e(
+                        session=sess,
+                        draft_list_id=draft_list_id,
+                        draft_elem_id=draft_elem_id,
+                        session_key=sk,
+                        recipients=[(sess.user_email, pub_key)],
+                        sender_ecc_priv=sess.priv_ecc,
+                        sender_ecc_pub=sess.pub_ecc,
+                        sender_key_version=sess.user_key_version,
+                        attachment_keys=attachment_keys or None,
+                    )
+                else:
+                    await self.client.send_draft(
+                        sess, draft_list_id, draft_elem_id, sk,
+                        attachment_keys=attachment_keys or None,
+                    )
+            else:
+                await self.client.send_draft(
+                    sess, draft_list_id, draft_elem_id, sk,
+                    attachment_keys=attachment_keys or None,
+                )
+
+            logger.info(
+                "[%s] APPEND %r → sent to self (→ Inbox), subject=%r, attachments=%d",
+                self.peer, mailbox_name, subject, len(uploaded),
+            )
+            # Nie znamy UID ani list_id docelowego maila w Inbox (przyjedzie asynchronicznie)
+            self._ok(tag, "APPEND completed")
+        except Exception as e:
+            logger.error("[%s] APPEND %r — send to self failed: %s", self.peer, mailbox_name, e)
+            self._no(tag, f"APPEND failed: {e}")
 
     # -----------------------------------------------------------------------
     # Zarządzanie folderami — CREATE / DELETE / RENAME
@@ -1565,49 +1780,72 @@ class IMAPConnection:
         except Exception as e:
             logger.warning(f"[{self.peer}] IDLE watcher: {e}")
 
-    async def _idle_handle_new_mail(self, list_id: str, element_id: str) -> None:
-        # Tuta może jeszcze przetwarzać mail w chwili wysłania WebSocket eventu
-        # (pole 102 = _ownerEncSessionKey bywa tymczasowo null). Retry z wykładniczym backoff.
-        mail_raw = None
-        for attempt in range(4):
-            if attempt > 0:
-                await asyncio.sleep(2 ** (attempt - 1))  # 1, 2, 4 s
-            try:
-                mail_raw = await self.client.get_single_mail(self.session, list_id, element_id)
-                if mail_raw.get("102") is not None:
-                    break
-                logger.debug(f"[{self.peer}] IDLE: pole 102 null dla {element_id}, attempt {attempt + 1}")
-            except Exception as e:
-                logger.warning(f"[{self.peer}] IDLE new mail fetch {element_id} attempt {attempt + 1}: {e}")
-                mail_raw = None
-        if not mail_raw or mail_raw.get("102") is None:
-            logger.warning(f"[{self.peer}] IDLE: pominięto {element_id} — brak _ownerEncSessionKey po retries")
-            return
+    @staticmethod
+    def _is_mail_decryptable(mail_raw: dict) -> bool:
+        """Zwraca True jeśli mail ma klucz sesji (pole 102) lub TutaCrypt PQ (pole 1310)."""
+        if mail_raw.get("102"):
+            return True
+        return bool(mail_raw.get("1310"))
 
-
-        # mail["1465"] = [[mailset_list, mailset_id]] — sprawdź czy mail należy do zaznaczonego folderu
+    def _insert_mail_raw(self, mail_raw: dict) -> bool:
+        """
+        Wstawia mail do aktualnej skrzynki w kolejności UID.
+        Zwraca True jeśli mail pasuje do bieżącego folderu i został dodany, False wpp.
+        Nie wysyła EXISTS — wywołujący odpowiada za notyfikację.
+        """
+        if not self.mailbox:
+            return False
+        # 1465 = mailSet — sprawdź czy mail należy do zaznaczonego folderu
         folder_refs = mail_raw.get("1465", [])
         in_folder = any(
             isinstance(ref, list) and len(ref) >= 2 and ref[1] == self.mailbox.folder.id
             for ref in folder_refs
         )
         if not in_folder:
-            return
-
-        # Wstaw w kolejności UID
+            return False
         uid = tuta_id_to_uid(mail_raw.get("99", ""))
+        # Pomiń jeśli już w skrzynce (np. podwójny event)
+        if any(tuta_id_to_uid(m.get("99", "")) == uid for m in self.mailbox.messages):
+            return False
         insert_pos = len(self.mailbox.messages)
         for i, m in enumerate(self.mailbox.messages):
             if tuta_id_to_uid(m.get("99", "")) > uid:
                 insert_pos = i
                 break
         self.mailbox.messages.insert(insert_pos, mail_raw)
+        return True
 
-        count = self.mailbox.exists
-        self._send(f"* {count} EXISTS")
-        self._send(f"* 0 RECENT")
-        await self.writer.drain()
-        logger.info(f"[{self.peer}] IDLE: new mail uid={uid}, folder={self.mailbox.folder.id}, EXISTS={count}")
+    async def _idle_handle_new_mail(self, list_id: str, element_id: str) -> None:
+        # Tuta może jeszcze przetwarzać mail w chwili wysłania WebSocket eventu.
+        # Retry z wykładniczym backoff — czekamy aż mail będzie dekrypowalny
+        # (pole 102 non-null LUB pole 1310 z PQ message obecne).
+        mail_raw = None
+        for attempt in range(4):
+            if attempt > 0:
+                await asyncio.sleep(2 ** (attempt - 1))  # 1, 2, 4 s
+            try:
+                mail_raw = await self.client.get_single_mail(self.session, list_id, element_id)
+                if self._is_mail_decryptable(mail_raw):
+                    break
+                logger.debug(f"[{self.peer}] IDLE: mail {element_id} niedekrypowalny, attempt {attempt + 1}")
+            except Exception as e:
+                logger.warning(f"[{self.peer}] IDLE new mail fetch {element_id} attempt {attempt + 1}: {e}")
+                mail_raw = None
+        if not mail_raw or not self._is_mail_decryptable(mail_raw):
+            logger.warning(
+                f"[{self.peer}] IDLE: mail {element_id} niedekrypowalny po retries — "
+                f"odkładam do pending (retry przy NOOP)"
+            )
+            self._pending_mail_ids[element_id] = (list_id, element_id)
+            return
+
+        if self._insert_mail_raw(mail_raw):
+            count = self.mailbox.exists
+            self._send(f"* {count} EXISTS")
+            self._send(f"* 0 RECENT")
+            await self.writer.drain()
+            uid = tuta_id_to_uid(mail_raw.get("99", ""))
+            logger.info(f"[{self.peer}] IDLE: new mail uid={uid}, folder={self.mailbox.folder.id}, EXISTS={count}")
 
     async def _idle_handle_mail_update(self, list_id: str, element_id: str) -> None:
         # Znajdź mail w bieżącej skrzynce (jeśli tam jest)
@@ -1631,7 +1869,15 @@ class IMAPConnection:
         )
 
         if in_current and local_idx is None:
-            # Mail pojawił się w tym folderze (przeniesiony z innego) → dodaj jak nowy
+            # Mail pojawił się w tym folderze (przeniesiony z innego) → dodaj jak nowy.
+            # Jeśli nie jest jeszcze dekrypowalny (pole 1310/102 jeszcze nie gotowe),
+            # pomiń — kolejny UPDATE event (gdy Tuta ustawi pole 102) doda go poprawnie.
+            if not self._is_mail_decryptable(updated):
+                logger.debug(
+                    "[%s] IDLE update: mail %s niedekrypowalny, pomijam — czekam na kolejny UPDATE",
+                    self.peer, element_id,
+                )
+                return
             uid = tuta_id_to_uid(updated.get("99", ""))
             insert_pos = len(self.mailbox.messages)
             for i, m in enumerate(self.mailbox.messages):
@@ -1641,7 +1887,6 @@ class IMAPConnection:
             self.mailbox.messages.insert(insert_pos, updated)
             count = self.mailbox.exists
             self._send(f"* {count} EXISTS")
-            self._send(f"* 0 RECENT")
             logger.info(f"[{self.peer}] IDLE: mail moved INTO folder uid={uid}, EXISTS={count}")
         elif not in_current and local_idx is not None:
             # Mail opuścił ten folder (przeniesiony gdzie indziej) → EXPUNGE
@@ -1801,6 +2046,9 @@ class IMAPServer:
         self.port = port
         self.cache_path = cache_path
         self._server: Optional[asyncio.AbstractServer] = None
+        # Deduplikacja APPEND: {(email, sha256_hex) → monotonic_time}
+        # Chroniony przed race condition bo asyncio jest single-threaded.
+        self._append_dedup: "dict[tuple[str, str], float]" = {}
 
     async def start(self) -> None:
         # Jeden TutaClient i cache współdzielone między połączeniami
@@ -1830,7 +2078,7 @@ class IMAPServer:
         reader: asyncio.StreamReader,
         writer: asyncio.StreamWriter,
     ) -> None:
-        conn = IMAPConnection(reader, writer, self._tuta, self._cache)
+        conn = IMAPConnection(reader, writer, self._tuta, self._cache, self._append_dedup)
         await conn.handle()
 
 

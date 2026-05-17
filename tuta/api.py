@@ -45,6 +45,8 @@ from .crypto import (
     b64url_encode,
     decrypt_user_group_key,
     pq_encapsulate_bucket_key,
+    pq_decapsulate_bucket_key,
+    reconstruct_kyber_sk,
     rsa_oaep_encrypt_tuta,
     TUTA_AES128_KEY_LEN,
 )
@@ -96,6 +98,12 @@ class Session:
     mail_group_id: Optional[str] = None          # elementId grupy mail (wypełniane przez get_folders)
     mail_group_key_version: str = "0"            # wersja klucza grupy mail (pole 2246 w GroupMembership)
     user_email: str = ""                         # adres email zalogowanego użytkownika
+    # Klucze asymetryczne do deszyfrowania TutaCrypt PQ (pole 1310)
+    priv_ecc: Optional[bytes] = None             # X25519 klucz prywatny (32B)
+    pub_ecc: Optional[bytes] = None              # X25519 klucz publiczny (32B)
+    pub_kyber_tuta: Optional[bytes] = None       # Kyber klucz publiczny w formacie Tuty (1572B)
+    kyber_sk: Optional[bytes] = None             # Pełny klucz prywatny Kyber1024 (3168B)
+    user_key_version: str = "0"                  # Wersja klucza grupy użytkownika (pole 2271)
 
 
 @dataclass
@@ -273,12 +281,17 @@ class TutaClient:
             access_token, user_id, password, salt, kdf_version
         )
 
-        return Session(
+        session = Session(
             access_token=access_token,
             user_id=user_id,
             user_group_key=user_group_key,
             user_email=email,
         )
+
+        # Krok 6 — klucze asymetryczne do TutaCrypt PQ decapsulation
+        await self._load_pq_keys(session)
+
+        return session
 
     async def _load_user_keys(
         self,
@@ -322,6 +335,55 @@ class TutaClient:
         except Exception as e:
             logger.error(f"Błąd deszyfrowania klucza grupy: {e}")
             return b"\x00" * 32
+
+    async def _load_pq_keys(self, session: Session) -> None:
+        """
+        Ładuje i odszyfrowuje klucze asymetryczne ECC + Kyber z grupy użytkownika.
+        Klucze są potrzebne do TutaCrypt PQ decapsulation (pole 1310 w mailu).
+        Ustawia session.priv_ecc, pub_ecc, pub_kyber_tuta, kyber_sk.
+        """
+        from .crypto import reconstruct_kyber_sk
+
+        try:
+            user_data = await self._get(
+                self._url("sys", "user", session.user_id),
+                token=session.access_token
+            )
+            user_group_list = user_data.get("95", [])
+            ug = user_group_list[0] if isinstance(user_group_list, list) and user_group_list else {}
+            g_ref = ug.get("29", [""])
+            user_group_id = g_ref[-1] if isinstance(g_ref, list) else g_ref
+
+            group_data = await self._get(
+                self._url("sys", "group", user_group_id),
+                token=session.access_token
+            )
+            current_keys = group_data.get("13", {})
+            if isinstance(current_keys, list):
+                current_keys = current_keys[0] if current_keys else {}
+
+            pub_ecc_raw    = base64.b64decode(current_keys.get("2144", "") or "")
+            enc_priv_ecc   = base64.b64decode(current_keys.get("2145", "") or "")
+            pub_kyber_tuta = base64.b64decode(current_keys.get("2146", "") or "")
+            enc_priv_kyber = base64.b64decode(current_keys.get("2147", "") or "")
+
+            if not enc_priv_ecc or not enc_priv_kyber:
+                logger.warning("Brak kluczy asymetrycznych w grupie — TutaCrypt PQ niedostępny")
+                return
+
+            priv_ecc       = aes_decrypt_tuta(session.user_group_key, enc_priv_ecc)
+            priv_kyber_raw = aes_decrypt_tuta(session.user_group_key, enc_priv_kyber)
+            kyber_sk       = reconstruct_kyber_sk(priv_kyber_raw, pub_kyber_tuta)
+
+            session.priv_ecc        = priv_ecc
+            session.pub_ecc         = pub_ecc_raw
+            session.pub_kyber_tuta  = pub_kyber_tuta
+            session.kyber_sk        = kyber_sk
+            session.user_key_version = str(group_data.get("2271", "0") or "0")
+            logger.info("Klucze PQ załadowane: priv_ecc=%dB kyber_sk=%dB kv=%s",
+                        len(priv_ecc), len(kyber_sk), session.user_key_version)
+        except Exception as e:
+            logger.warning("Nie udało się załadować kluczy PQ: %s", e)
 
     async def logout(self, session: Session) -> None:
         url = self._url("sys", "session", session.access_token)
@@ -719,8 +781,28 @@ class TutaClient:
         """
         from .crypto import decrypt_mail_session_key, decrypt_mail_body, uncompress_lz4
 
-        enc_sk = base64.b64decode(mail.get("102") or "")
-        mail_key = decrypt_mail_session_key(mail_group_key, enc_sk)
+        enc_sk_b64 = mail.get("102") or ""
+        if enc_sk_b64:
+            mail_key = decrypt_mail_session_key(mail_group_key, base64.b64decode(enc_sk_b64))
+        else:
+            # TutaCrypt PQ path — Tuta→Tuta E2E: pole 1310 = internalRecipientKeyData
+            field_1310 = mail.get("1310") or []
+            if not field_1310 or not session.priv_ecc or not session.kyber_sk:
+                raise TutaAPIError(0, f"Brak klucza sesji (pole 102 null, brak PQ keys lub pola 1310) dla maila {mail.get('99', '?')}")
+            entry = field_1310[0] if isinstance(field_1310, list) else field_1310
+            pq_msg = base64.b64decode(entry.get("2045", ""))
+            bucket_key = pq_decapsulate_bucket_key(
+                session.priv_ecc, session.pub_ecc, session.pub_kyber_tuta, session.kyber_sk, pq_msg
+            )
+            mail_id = mail.get("99", ["", ""])
+            mail_elem_id = mail_id[1] if isinstance(mail_id, list) and len(mail_id) > 1 else str(mail_id)
+            mail_key = None
+            for e in (entry.get("2048") or []):
+                if e.get("2041") == mail_elem_id:
+                    mail_key = aes_decrypt_tuta(bucket_key, base64.b64decode(e["2042"]))
+                    break
+            if mail_key is None:
+                raise TutaAPIError(0, f"Brak pasującego elementId {mail_elem_id!r} w 1310[0]['2048']")
 
         draft_ref = mail.get("1309")
         logger.debug(f"decrypt_mail_content: mail_id={mail.get('99')} 1308={mail.get('1308')!r} 1309={draft_ref!r}")
@@ -939,13 +1021,44 @@ class TutaClient:
         Pobiera i odszyfrowuje wszystkie załączniki maila.
         Zwraca listę słowników: {name, mime_type, cid, data}.
         mail_raw["115"] = [[listId, elementId], ...] — referencje do File.
+
+        Ścieżki deszyfrowania klucza pliku:
+          1. Pole 18 (_ownerEncSessionKey): AES(mail_group_key, file_sk) — maile non-E2E
+          2. Pole 1310 → 2048: bucket_key → AES(bucket_key, file_sk) — maile E2E (TutaCrypt)
+             Serwer kasuje pole 18 dla plików w mailach E2E; klucz pliku jest w tablicy
+             instanceSessionKeys (2048) tego samego BucketKey co klucz maila.
         """
-        from .crypto import decrypt_mail_session_key, aes_decrypt_tuta
+        from .crypto import decrypt_mail_session_key, aes_decrypt_tuta, pq_decapsulate_bucket_key
         from .message_builder import _decrypt_str
 
         file_refs = mail_raw.get("115", [])
         if not file_refs:
             return []
+
+        # Lazy-compute bucket_key + mapa instanceId→encSessionKey z pola 1310.
+        # Potrzebne tylko gdy pole 18 jest null (maile E2E).
+        _pq_data: "tuple[bytes, dict] | None | bool" = False  # False = nie sprawdzane
+
+        def _get_pq_sk_map() -> "tuple[bytes, dict] | None":
+            """Zwraca (bucket_key, {elem_id: enc_sk_b64}) lub None jeśli niedostępne."""
+            nonlocal _pq_data
+            if _pq_data is False:
+                field_1310 = mail_raw.get("1310") or []
+                if field_1310 and session.priv_ecc and session.kyber_sk:
+                    entry = field_1310[0] if isinstance(field_1310, list) else field_1310
+                    pq_msg = base64.b64decode(entry.get("2045", ""))
+                    bk = pq_decapsulate_bucket_key(
+                        session.priv_ecc, session.pub_ecc,
+                        session.pub_kyber_tuta, session.kyber_sk, pq_msg,
+                    )
+                    sk_map = {
+                        e.get("2041"): e.get("2042", "")
+                        for e in (entry.get("2048") or [])
+                    }
+                    _pq_data = (bk, sk_map)
+                else:
+                    _pq_data = None
+            return _pq_data  # type: ignore[return-value]
 
         attachments = []
         for file_ref in file_refs:
@@ -959,8 +1072,28 @@ class TutaClient:
                 continue
 
             try:
-                enc_sk = base64.b64decode(file_obj.get("18", ""))
-                file_key = decrypt_mail_session_key(mail_group_key, enc_sk)
+                enc_sk_b64 = file_obj.get("18") or ""
+                if enc_sk_b64:
+                    # Ścieżka 1: ownerEncSessionKey — maile non-E2E
+                    file_key = decrypt_mail_session_key(
+                        mail_group_key, base64.b64decode(enc_sk_b64)
+                    )
+                else:
+                    # Ścieżka 2: BucketKey (1310 → 2048) — maile E2E
+                    pq = _get_pq_sk_map()
+                    if pq is None:
+                        raise ValueError(
+                            "Pole 18 null i brak PQ keys/pola 1310 — nie można odszyfrować"
+                        )
+                    bucket_key, sk_map = pq
+                    enc_file_sk_b64 = sk_map.get(element_id, "")
+                    if not enc_file_sk_b64:
+                        raise ValueError(
+                            f"Brak klucza pliku {element_id!r} w 1310[0]['2048']"
+                        )
+                    file_key = aes_decrypt_tuta(
+                        bucket_key, base64.b64decode(enc_file_sk_b64)
+                    )
             except Exception as e:
                 logger.warning(f"Nie udało się odszyfrować klucza pliku {element_id}: {e}")
                 continue

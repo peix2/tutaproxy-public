@@ -425,6 +425,25 @@ def decrypt_mail_body(mail_session_key: bytes, enc_body: bytes) -> bytes:
     return aes_decrypt_tuta(mail_session_key, enc_body)
 
 
+def resolve_bucket_session_key(mail_group_key: bytes, group_enc_bucket_key: bytes, bucket_enc_session_key: bytes) -> bytes:
+    """
+    Odszyfrowuje session key przez mechanizm BucketKey (maile Tuta→Tuta E2E).
+
+    Pole 866 = groupEncBucketKey, dwa warianty zależnie od rozmiaru mail_group_key:
+      - 16B key → aes128_encrypt(key, 32B_bucket_key)  → 65B (1+16+48, version 0x01, brak HMAC)
+      - 32B key → aes_encrypt_tuta(key, 16B_bucket_key, no_padding) → 65B (1+16+16+32, version 0x01 z HMAC)
+    Pole 1120 = bucketEncSessionKey: aes_encrypt_tuta(bucket_key, session_key, no_padding) → 65B.
+    """
+    if len(mail_group_key) == TUTA_AES128_KEY_LEN:
+        bucket_key = aes128_decrypt(mail_group_key, group_enc_bucket_key)
+    elif len(mail_group_key) == TUTA_AES256_KEY_LEN:
+        # AesCbcThenHmac: SHA-512(key)[:32] jako klucz AES, HMAC na końcu
+        bucket_key = aes_decrypt_tuta(mail_group_key, group_enc_bucket_key)
+    else:
+        raise ValueError(f"Nieobsługiwany rozmiar mail_group_key: {len(mail_group_key)}B")
+    return aes_decrypt_tuta(bucket_key, bucket_enc_session_key)
+
+
 # ---------------------------------------------------------------------------
 # LZ4 decompress — format używany przez Tutę do kompresji treści maili
 # ---------------------------------------------------------------------------
@@ -606,6 +625,55 @@ def hkdf_sha256(salt: bytes, ikm: bytes, info: bytes, length: int = 32) -> bytes
 
 # CryptoProtocolVersion.TUTA_CRYPT = "2" → bajt w soli HKDF
 _TUTA_CRYPT_PROTO_BYTE = bytes([2])
+
+
+def reconstruct_kyber_sk(priv_kyber_bytes: bytes, pub_kyber_tuta: bytes) -> bytes:
+    """
+    Rekonstruuje pełny 3168B klucz prywatny Kyber1024 z formatu Tuty.
+
+    Format Tuty:
+      priv_kyber_bytes = pq_encode_parts([s(1536B), H_pk(32B), z(32B)])  — 3178B
+      pub_kyber_tuta   = pq_encode_parts([t(1536B), rho(32B)])            — 1572B
+
+    Kyber1024 sk (standard kyber-py): s || t || rho || H_pk || z = 3168B
+    """
+    s, H_pk, z = pq_decode_parts(priv_kyber_bytes, 3)
+    t, rho = pq_decode_parts(pub_kyber_tuta, 2)
+    return s + t + rho + H_pk + z
+
+
+def pq_decapsulate_bucket_key(
+    priv_ecc: bytes,
+    pub_ecc: bytes,
+    pub_kyber_tuta: bytes,
+    kyber_sk: bytes,
+    pq_message: bytes,
+) -> bytes:
+    """
+    TutaCrypt decapsulation — odwrotność pq_encapsulate_bucket_key.
+
+    pq_message = pq_encode_parts([sender_ecc_pub, eph_pub, kyber_ct, kek_enc_bucket_key])
+    Zwraca bucket_key (32B).
+    """
+    try:
+        from kyber_py.kyber import Kyber1024
+    except ModuleNotFoundError:
+        raise RuntimeError("Brak kyber-py: pip install kyber-py")
+
+    sender_ecc_pub, eph_pub, kyber_ct, kek_enc_bucket_key = pq_decode_parts(pq_message, 4)
+
+    ecc_eph_shared  = x25519_dh(priv_ecc, eph_pub)
+    ecc_auth_shared = x25519_dh(priv_ecc, sender_ecc_pub)
+    kyber_shared    = Kyber1024.decaps(kyber_sk, kyber_ct)
+
+    context = (
+        sender_ecc_pub + eph_pub + pub_ecc
+        + pub_kyber_tuta + kyber_ct
+        + _TUTA_CRYPT_PROTO_BYTE
+    )
+    ikm = ecc_eph_shared + ecc_auth_shared + kyber_shared
+    kek = hkdf_sha256(salt=context, ikm=ikm, info=b"kek", length=32)
+    return aes_decrypt_tuta(kek, kek_enc_bucket_key)
 
 
 def pq_encapsulate_bucket_key(

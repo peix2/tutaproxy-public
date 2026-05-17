@@ -18,6 +18,7 @@ Tuta is a privacy-focused email service with strong end-to-end encryption. It on
 - **Send email** — SMTP sending with attachment support
 - **End-to-end encryption** — Tuta→Tuta emails are sent with full E2E encryption (ECC + ML-KEM/Kyber); emails to external addresses (@gmail.com etc.) are sent as standard email, same as the official client
 - **Attachments** — download and upload, including inline images
+- **Import from other accounts** — copy or move messages from Gmail or any other IMAP account into Tuta (with attachments); messages land in Inbox as properly encrypted Tuta mail
 - **Folder management** — create, rename, delete folders; move messages between folders (IMAP COPY)
 - **Push updates** — IMAP IDLE support so your client gets notified of new mail without polling
 - **Flags** — read/unread, deleted (with EXPUNGE)
@@ -122,6 +123,7 @@ Any client that supports IMAP4rev1 with AUTH=PLAIN and standard SMTP AUTH should
 - Sending mail (plain text, HTML, attachments)
 - Folder create / rename / delete
 - Moving messages between folders
+- Importing messages from other IMAP accounts (with attachments) via IMAP APPEND
 - Read/unread flags
 - Delete + expunge
 - IDLE (push notifications)
