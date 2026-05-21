@@ -2,7 +2,7 @@
 
 An unofficial IMAP/SMTP proxy that lets you access your [Tuta](https://tuta.com) email account from any standard email client — Thunderbird, Apple Mail, Mutt, or anything else that speaks IMAP and SMTP.
 
-> **Disclaimer:** This project is not affiliated with, endorsed by, or connected to Tutanota GmbH in any way. Use at your own risk. "Tuta" and "Tutanota" are trademarks of Tutanota GmbH.
+> **Disclaimer:** This project is not affiliated with, endorsed by, or connected to Tutao GmbH in any way. Use at your own risk. "Tuta" and "Tutanota" are trademarks of Tutao GmbH.
 
 ---
 
@@ -167,5 +167,5 @@ Feel free to express it by donation in Monero (XMR): 88dSpPtjYmKifkaMQ9Nm7ogD1ZR
 
 AGPL v3. See [LICENSE](LICENSE).
 
-This project is not affiliated with Tutanota GmbH. The Tuta API is used solely for personal interoperability purposes.
+This project is not affiliated with Tutao GmbH. The Tuta API is used solely for personal interoperability purposes.
 
