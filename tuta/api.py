@@ -36,6 +36,7 @@ import aiohttp
 
 from .crypto import (
     compute_verifier,
+    derive_session_key,
     UserKeys,
     aes128_decrypt,
     aes_encrypt_tuta,
@@ -104,6 +105,7 @@ class Session:
     pub_kyber_tuta: Optional[bytes] = None       # Kyber klucz publiczny w formacie Tuty (1572B)
     kyber_sk: Optional[bytes] = None             # Pełny klucz prywatny Kyber1024 (3168B)
     user_key_version: str = "0"                  # Wersja klucza grupy użytkownika (pole 2271)
+    user_group_id: str = ""                      # elementId grupy użytkownika (potrzebne dla Secure External)
 
 
 @dataclass
@@ -149,7 +151,13 @@ class TutaClient:
 
     async def __aenter__(self):
         timeout = aiohttp.ClientTimeout(total=30)
-        self._http = aiohttp.ClientSession(headers=TUTA_HEADERS, timeout=timeout)
+        try:
+            import ssl, certifi
+            ssl_ctx = ssl.create_default_context(cafile=certifi.where())
+            connector = aiohttp.TCPConnector(ssl=ssl_ctx)
+        except ImportError:
+            connector = None
+        self._http = aiohttp.ClientSession(headers=TUTA_HEADERS, timeout=timeout, connector=connector)
         return self
 
     async def __aexit__(self, *_):
@@ -380,6 +388,7 @@ class TutaClient:
             session.pub_kyber_tuta  = pub_kyber_tuta
             session.kyber_sk        = kyber_sk
             session.user_key_version = str(group_data.get("2271", "0") or "0")
+            session.user_group_id   = user_group_id
             logger.info("Klucze PQ załadowane: priv_ecc=%dB kyber_sk=%dB kv=%s",
                         len(priv_ecc), len(kyber_sk), session.user_key_version)
         except Exception as e:
@@ -1559,6 +1568,271 @@ class TutaClient:
             for ref in mail.get("115", [])
             if isinstance(ref, list) and len(ref) >= 2
         ]
+
+    # ------------------------------------------------------------------
+    # Secure External — wysyłka do zewnętrznych odbiorców z hasłem
+    # ------------------------------------------------------------------
+
+    def _mail_address_to_custom_id(self, mail_address: str) -> str:
+        """Konwertuje adres email na CustomId (base64url UTF-8 bajtów)."""
+        return base64.urlsafe_b64encode(
+            mail_address.strip().lower().encode()
+        ).rstrip(b"=").decode()
+
+    async def _get_external_user_refs_list_id(self, session: Session) -> str:
+        """
+        Zwraca listId ExternalUserReferences z GroupRoot użytkownika.
+
+        Tuta używa dwustopniowego loadRoot:
+          1. GET /rest/sys/rootinstance/{userGroupId}/A3N5cwBu → RootInstance.reference
+          2. GET /rest/sys/grouproot/{reference}              → GroupRoot.externalUserReferences
+        """
+        if not session.user_group_id:
+            raise TutaAPIError(0, "user_group_id niedostępny — PQ keys nie załadowane")
+
+        # Krok 1: RootInstance (listId=userGroupId, elemId=GroupRoot.rootId)
+        GROUP_ROOT_ROOT_ID = "A3N5cwBu"
+        root_instance_url = self._url("sys", "rootinstance", session.user_group_id, GROUP_ROOT_ROOT_ID)
+        logger.debug(f"GET RootInstance (GroupRoot): {root_instance_url}")
+        root_instance = await self._get(root_instance_url, token=session.access_token)
+        group_root_id = root_instance.get("236", "")  # reference
+
+        # Krok 2: GroupRoot
+        group_root_url = self._url("sys", "grouproot", group_root_id)
+        logger.debug(f"GET GroupRoot: {group_root_url}")
+        group_root = await self._get(group_root_url, token=session.access_token)
+        logger.debug(f"GroupRoot raw 117={group_root.get('117')!r}")
+        ext_refs = group_root.get("117", "")
+        # LIST_ASSOCIATION może przyjść jako lista [listId] lub plain string
+        if isinstance(ext_refs, list):
+            ext_refs = ext_refs[0] if ext_refs else ""
+        return ext_refs
+
+    async def _get_or_create_external_user(
+        self,
+        session: Session,
+        mail_address: str,
+        password_key: bytes,
+        verifier: bytes,
+        mail_group_key: bytes,
+    ) -> "tuple[bytes, bytes]":
+        """
+        Zwraca (externalUserGroupKey, externalMailGroupKey) dla odbiorcy zewnętrznego.
+        Tworzy konto przez ExternalUserService jeśli odbiorca nie istnieje jeszcze w systemie.
+        """
+        cleaned = mail_address.strip().lower()
+        ext_refs_list_id = await self._get_external_user_refs_list_id(session)
+        mail_addr_custom_id = self._mail_address_to_custom_id(cleaned)
+
+        url = self._url("sys", "externaluserreference", ext_refs_list_id, mail_addr_custom_id)
+        logger.debug(f"GET ExternalUserReference: list={ext_refs_list_id} id={mail_addr_custom_id}")
+        try:
+            ext_ref = await self._get(url, token=session.access_token)
+        except TutaAPIError as e:
+            logger.debug(f"GET ExternalUserReference HTTP {e.status_code} — odbiorca nie istnieje")
+            if e.status_code not in (404, 400):
+                raise
+            logger.debug(f"Secure External: odbiorca {cleaned} nie istnieje (HTTP {e.status_code}), tworzę konto")
+            return await self._create_external_user(session, cleaned, password_key, verifier, mail_group_key)
+
+        # Odbiorca istnieje — załaduj jego klucze
+        # Pola 108/109 mogą być listą (ELEMENT_ASSOCIATION) — bierzemy ostatni element
+        ext_user_id_raw = ext_ref.get("108", "")
+        ext_user_id = ext_user_id_raw[-1] if isinstance(ext_user_id_raw, list) else ext_user_id_raw
+        ext_user_group_id_raw = ext_ref.get("109", "")
+        ext_user_group_id = ext_user_group_id_raw[-1] if isinstance(ext_user_group_id_raw, list) else ext_user_group_id_raw
+        logger.debug(f"Secure External: odbiorca {cleaned} już istnieje (user={ext_user_id!r} group={ext_user_group_id!r}), ładuję klucze")
+        return await self._load_existing_external_user_keys(session, ext_user_id, ext_user_group_id)
+
+    async def _load_existing_external_user_keys(
+        self,
+        session: Session,
+        ext_user_id: str,
+        ext_user_group_id: str,
+    ) -> "tuple[bytes, bytes]":
+        """Ładuje klucze istniejącego zewnętrznego użytkownika."""
+        # Załaduj dane użytkownika zewnętrznego
+        user_data = await self._get(self._url("sys", "user", ext_user_id), token=session.access_token)
+
+        # Znajdź grupę mail (groupType=5)
+        memberships = user_data.get("96", [])
+        ext_mail_group_id = None
+        for m in memberships:
+            if str(m.get("1030", "")) == "5":
+                g_ref = m.get("29", [""])
+                ext_mail_group_id = g_ref[-1] if isinstance(g_ref, list) else g_ref
+                break
+        if not ext_mail_group_id:
+            raise TutaAPIError(0, f"Brak grupy mail dla zewnętrznego użytkownika {ext_user_id}")
+
+        # Załaduj obie grupy
+        ext_user_group = await self._get(self._url("sys", "group", ext_user_group_id), token=session.access_token)
+        ext_mail_group = await self._get(self._url("sys", "group", ext_mail_group_id), token=session.access_token)
+
+        # Odszyfruj ext_user_group_key używając naszego user_group_key
+        enc_ext_user_key = base64.b64decode(ext_user_group.get("11", "") or "")
+        ext_user_group_key = aes_decrypt_tuta(session.user_group_key, enc_ext_user_key)
+
+        # Odszyfruj ext_mail_group_key używając ext_user_group_key
+        enc_ext_mail_key = base64.b64decode(ext_mail_group.get("11", "") or "")
+        ext_mail_group_key = aes_decrypt_tuta(ext_user_group_key, enc_ext_mail_key)
+
+        return ext_user_group_key, ext_mail_group_key
+
+    async def _create_external_user(
+        self,
+        session: Session,
+        mail_address: str,
+        password_key: bytes,
+        verifier: bytes,
+        mail_group_key: bytes,
+    ) -> "tuple[bytes, bytes]":
+        """
+        Tworzy konto zewnętrznego użytkownika przez ExternalUserService (POST).
+        Zwraca (externalUserGroupKey, externalMailGroupKey).
+        """
+        ext_user_group_key   = os.urandom(32)
+        ext_mail_group_key   = os.urandom(32)
+        ext_user_group_info_sk  = os.urandom(32)
+        ext_mail_group_info_sk  = os.urandom(32)
+        tutanota_props_sk    = os.urandom(32)
+        mailbox_sk           = os.urandom(32)
+        entropy              = os.urandom(32)
+
+        def enc_key(enc_with: bytes, key: bytes) -> str:
+            return base64.b64encode(aes_encrypt_tuta(enc_with, key, add_padding=False)).decode()
+
+        user_group_data = {
+            "139": _random_custom_id(),
+            "141": mail_address,
+            "142": enc_key(password_key, ext_user_group_key),        # externalPwEncUserGroupKey
+            "143": enc_key(session.user_group_key, ext_user_group_key),  # internalUserEncUserGroupKey
+            "1433": session.user_key_version,                         # internalUserGroupKeyVersion
+        }
+
+        body = {
+            "146": "0",                                               # _format
+            "1323": "1",                                              # kdfVersion = argon2id
+            "1429": session.mail_group_key_version,                   # internalMailGroupKeyVersion
+            "149": base64.b64encode(verifier).decode(),               # verifier = sha256(passwordKey)
+            "412": base64.b64encode(                                  # externalUserEncEntropy (z paddingiem)
+                aes_encrypt_tuta(ext_user_group_key, entropy, add_padding=True)
+            ).decode(),
+            "148": enc_key(ext_user_group_key, ext_mail_group_key),   # externalUserEncMailGroupKey
+            "150": enc_key(ext_user_group_key, ext_user_group_info_sk),  # externalUserEncUserGroupInfoSessionKey
+            "672": enc_key(ext_user_group_key, tutanota_props_sk),    # externalUserEncTutanotaPropertiesSessionKey
+            "670": enc_key(ext_mail_group_key, ext_mail_group_info_sk),  # externalMailEncMailGroupInfoSessionKey
+            "673": enc_key(ext_mail_group_key, mailbox_sk),           # externalMailEncMailBoxSessionKey
+            "669": enc_key(mail_group_key, ext_user_group_info_sk),   # internalMailEncUserGroupInfoSessionKey
+            "671": enc_key(mail_group_key, ext_mail_group_info_sk),   # internalMailEncMailGroupInfoSessionKey
+            "151": [user_group_data],                                  # userGroupData (AGGREGATION → lista)
+        }
+
+        headers = {"accessToken": session.access_token, **TUTANOTA_HEADERS}
+        logger.debug(f"ExternalUserService POST dla {mail_address}")
+        async with self._http.post(
+            self.base_url + "/rest/tutanota/externaluserservice",
+            json=body,
+            headers=headers,
+        ) as r:
+            text = await r.text()
+            if r.status not in (200, 201, 204):
+                logger.warning(f"ExternalUserService {r.status}: {text[:400]}")
+                raise TutaAPIError(r.status, text)
+        logger.info(f"Secure External: konto utworzone dla {mail_address}")
+        return ext_user_group_key, ext_mail_group_key
+
+    async def send_draft_secure_external(
+        self,
+        session: Session,
+        draft_list_id: str,
+        draft_elem_id: str,
+        session_key: bytes,
+        mail_group_key: bytes,
+        recipients: "list[tuple[str, str]]",
+        attachment_keys: "list[tuple[str, str, bytes]] | None" = None,
+        sender_name: str = "",
+    ) -> None:
+        """
+        Wysyła draft do odbiorców zewnętrznych z szyfrowaniem Secure External.
+
+        recipients: lista (mail_address, password) — hasło przekazane przez X-Tuta-Password.
+        Dla każdego odbiorcy: argon2id(password, salt) → klucz → szyfruje bucket_key.
+        Odbiorca dostaje link do app.tuta.com, gdzie wpisuje hasło.
+        """
+        bucket_key = os.urandom(32)
+        bucket_enc_session_key = aes_encrypt_tuta(bucket_key, session_key, add_padding=False)
+
+        secure_ext_key_data = []
+        for addr, password in recipients:
+            salt = os.urandom(16)
+            password_key = derive_session_key(password, salt, kdf_version=1)
+            verifier = hashlib.sha256(password_key).digest()
+
+            ext_user_group_key, ext_mail_group_key = await self._get_or_create_external_user(
+                session, addr, password_key, verifier, mail_group_key
+            )
+
+            secure_ext_key_data.append({
+                "533": _random_custom_id(),
+                "534": addr,
+                "536": base64.b64encode(verifier).decode(),
+                "538": base64.b64encode(salt).decode(),
+                "539": base64.b64encode(hashlib.sha256(salt).digest()).decode(),
+                "540": base64.b64encode(
+                    aes_encrypt_tuta(password_key, ext_user_group_key, add_padding=False)
+                ).decode(),
+                "599": base64.b64encode(
+                    aes_encrypt_tuta(ext_mail_group_key, bucket_key, add_padding=False)
+                ).decode(),
+                "1324": "1",   # kdfVersion = argon2id
+                "1417": "0",   # ownerKeyVersion
+                "1445": "0",   # userGroupKeyVersion
+            })
+
+        att_key_data = [
+            {
+                "543": _random_custom_id(),
+                "544": base64.b64encode(
+                    aes_encrypt_tuta(bucket_key, file_sk, add_padding=False)
+                ).decode(),
+                "545": None,
+                "546": [[flist_id, felem_id]],
+            }
+            for flist_id, felem_id, file_sk in (attachment_keys or [])
+        ]
+
+        body = {
+            "548": "0",
+            "549": "en",
+            "550": None,
+            "551": base64.b64encode(bucket_enc_session_key).decode(),
+            "552": sender_name or None,   # senderNameUnencrypted — podstawiane jako $senderName$ w notyfikacji
+            "675": "0",
+            "1117": "0",
+            "1444": None,
+            "1809": None,
+            "1822": "0",
+            "553": [],
+            "554": secure_ext_key_data,
+            "555": att_key_data,
+            "556": [[draft_list_id, draft_elem_id]],
+            "1353": [],
+            "1810": [],
+        }
+
+        headers = {"accessToken": session.access_token, **TUTANOTA_HEADERS}
+        logger.debug(f"send_draft_secure_external POST draft={draft_elem_id} recipients={[a for a,_ in recipients]}")
+        async with self._http.post(
+            self.base_url + "/rest/tutanota/senddraftservice",
+            json=body,
+            headers=headers,
+        ) as r:
+            text = await r.text()
+            if r.status not in (200, 201, 204):
+                logger.warning(f"send_draft_secure_external {r.status}: {text[:400]}")
+                raise TutaAPIError(r.status, text)
+        logger.info(f"send_draft_secure_external: draft {draft_elem_id} sent → {len(recipients)} odbiorców")
 
     async def send_draft(
         self,

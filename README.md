@@ -16,7 +16,8 @@ Tuta is a privacy-focused email service with strong end-to-end encryption. It on
 
 - **Read email** — full IMAP access to all your Tuta folders (Inbox, Sent, Drafts, Trash, Spam, Archive, and any custom folders)
 - **Send email** — SMTP sending with attachment support
-- **End-to-end encryption** — Tuta→Tuta emails are sent with full E2E encryption (ECC + ML-KEM/Kyber); emails to external addresses (@gmail.com etc.) are sent as standard email, same as the official client
+- **End-to-end encryption** — Tuta→Tuta emails are sent with full E2E encryption (ECC + ML-KEM/Kyber); emails to external addresses use standard delivery or Secure External (see below)
+- **Secure External** — send password-protected encrypted mail to non-Tuta recipients; they receive a link and enter the password to read the message on Tuta's portal
 - **Attachments** — download and upload, including inline images
 - **Import from other accounts** — copy or move messages from Gmail or any other IMAP account into Tuta (with attachments); messages land in Inbox as properly encrypted Tuta mail
 - **Folder management** — create, rename, delete folders; move messages between folders (IMAP COPY)
@@ -121,6 +122,7 @@ Any client that supports IMAP4rev1 with AUTH=PLAIN and standard SMTP AUTH should
 
 - Reading mail from all folders
 - Sending mail (plain text, HTML, attachments)
+- Sending encrypted mail to non-Tuta recipients (Secure External, password-protected)
 - Folder create / rename / delete
 - Moving messages between folders
 - Importing messages from other IMAP accounts (with attachments) via IMAP APPEND
@@ -135,6 +137,53 @@ Any client that supports IMAP4rev1 with AUTH=PLAIN and standard SMTP AUTH should
 - SEARCH is minimal — only `ALL` and `UNDELETED` are fully handled. Complex server-side search queries fall back to an empty result.
 - Tuta two-factor authentication (2FA) is not supported.
 - Only one Tuta account per proxy instance.
+
+---
+
+## Sending encrypted mail to external recipients (Secure External)
+
+Tuta's **Secure External** feature lets you send end-to-end encrypted email to anyone —
+even if they don't have a Tuta account. The recipient gets a notification email containing
+a link; clicking it opens `app.tuta.com` where they enter a password you share with them
+out-of-band to read the message.
+
+The proxy activates this mode when the outgoing message includes the custom SMTP header
+`X-Tuta-Password: <password>`. All recipients must be non-Tuta addresses (if any recipient
+has a Tuta account the proxy uses standard Tuta E2E encryption instead).
+
+### Setting up Thunderbird for Secure External
+
+1. Open `about:config` (type it in the Thunderbird address bar, or via Help → More Troubleshooting Information).
+2. Search for `mail.compose.other.header` and set its value to:
+   ```
+   X-Tuta-Password
+   ```
+   If the preference already has other values, append with a comma: `...,X-Tuta-Password`.
+3. In the compose window, click the `>>` button (top-right of the header area) and select
+   `X-Tuta-Password` from the list of available fields.
+4. Type the password in the new field. Share it with your recipient through a separate channel
+   (phone call, Signal, etc.).
+
+![Thunderbird compose window with the X-Tuta-Password custom header field](docs/thunderbird-secure-external.png)
+
+*Thunderbird compose window after adding the X-Tuta-Password field (UI shown in Polish:
+Nadawca = From, Do = To, Temat = Subject).*
+
+### What happens when you send
+
+1. The proxy reads the password from `X-Tuta-Password` and strips the header.
+2. A random salt is generated; `passwordKey = argon2id(password, salt)`.
+3. On first send to that address, the proxy creates an encrypted external account via Tuta's
+   `ExternalUserService`. On subsequent sends it reuses the existing account's keys.
+4. The message is encrypted with a bucket key derived from the recipient's account keys.
+5. The recipient receives a plain notification email with a link to `app.tuta.com`.
+   After entering the password they can read the fully decrypted message.
+
+### Limitations
+
+- The password must be shared with the recipient through a separate channel.
+- All recipients in one message must be non-Tuta addresses.
+- Replies from the recipient come through Tuta's web portal, not to your IMAP inbox.
 
 ---
 

@@ -134,28 +134,55 @@ class _TutaSMTPHandler:
 
         body_html, mime_attachments = _extract_body_and_attachments(msg)
 
+        # Hasło dla Secure External — opcjonalny nagłówek X-Tuta-Password
+        secure_password = _decode_header(msg.get("X-Tuta-Password", "")).strip() or None
+
         logger.info(
             f"SMTP send: from={from_addr} to={[a for _, a in to_list]} "
             f"cc={[a for _, a in cc_list]} subject={subject!r} "
-            f"attachments={len(mime_attachments)}"
+            f"attachments={len(mime_attachments)} secure_external={secure_password is not None}"
         )
 
         try:
             tuta_session = await self.client.login(email_addr, password)
             mail_group_key = await self.client.get_mail_group_key(tuta_session)
 
-            # Sprawdź czy wszyscy odbiorcy są użytkownikami Tuty
             all_addresses = [a for _, a in (to_list + cc_list + bcc_list)]
-            recipient_keys: dict[str, dict] = {}
-            is_e2e = True
-            for addr in all_addresses:
-                pub_key = await self.client.get_recipient_public_key(addr, tuta_session.access_token)
-                if pub_key is None:
-                    is_e2e = False
-                    break
-                recipient_keys[addr] = pub_key
 
-            logger.info(f"SMTP send: E2E={'tak' if is_e2e else 'nie'} recipients={all_addresses}")
+            # Secure External — gdy ustawiony X-Tuta-Password i wszyscy odbiorcy zewnętrzni
+            if secure_password is not None:
+                recipient_keys_check = {}
+                has_tuta_recipients = False
+                for addr in all_addresses:
+                    pub_key = await self.client.get_recipient_public_key(addr, tuta_session.access_token)
+                    if pub_key is not None:
+                        has_tuta_recipients = True
+                        break
+
+                if has_tuta_recipients:
+                    logger.warning(
+                        "X-Tuta-Password ustawiony, ale wśród odbiorców są konta Tuta — "
+                        "Secure External wymaga wyłącznie odbiorców zewnętrznych. Fallback: non-confidential."
+                    )
+                    secure_password = None
+                else:
+                    logger.info(f"SMTP send: Secure External recipients={all_addresses}")
+
+            # Sprawdź E2E (Tuta→Tuta) — tylko gdy nie Secure External
+            recipient_keys: dict[str, dict] = {}
+            is_e2e = False
+            if secure_password is None:
+                is_e2e = True
+                for addr in all_addresses:
+                    pub_key = await self.client.get_recipient_public_key(addr, tuta_session.access_token)
+                    if pub_key is None:
+                        is_e2e = False
+                        break
+                    recipient_keys[addr] = pub_key
+                logger.info(f"SMTP send: E2E={'tak' if is_e2e else 'nie'} recipients={all_addresses}")
+
+            # confidential=True przy E2E lub Secure External (wymagane przez API)
+            is_confidential = is_e2e or (secure_password is not None)
 
             # Upload załączników przed tworzeniem draftu
             draft_attachments: list[dict] = []
@@ -178,7 +205,7 @@ class _TutaSMTPHandler:
                 cc_recipients=cc_list,
                 bcc_recipients=bcc_list,
                 mail_group_key=mail_group_key,
-                confidential=is_e2e,
+                confidential=is_confidential,
                 attachments=draft_attachments,
             )
 
@@ -192,7 +219,19 @@ class _TutaSMTPHandler:
                     if i < len(file_ids):
                         attachment_keys.append((file_ids[i][0], file_ids[i][1], file_sk))
 
-            if is_e2e:
+            if secure_password is not None:
+                recipients_with_pw = [(addr, secure_password) for addr in all_addresses]
+                await self.client.send_draft_secure_external(
+                    session=tuta_session,
+                    draft_list_id=draft_list_id,
+                    draft_elem_id=draft_elem_id,
+                    session_key=sk,
+                    mail_group_key=mail_group_key,
+                    recipients=recipients_with_pw,
+                    attachment_keys=attachment_keys,
+                    sender_name=from_name,
+                )
+            elif is_e2e:
                 sender_priv, sender_pub, sender_ver = await self.client.get_sender_ecc_keypair(tuta_session)
                 recipients_with_keys = [(a, recipient_keys[a]) for a in all_addresses]
                 await self.client.send_draft_e2e(
