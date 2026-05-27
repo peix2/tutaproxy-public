@@ -2920,6 +2920,31 @@ class TutaClient:
                 raise TutaAPIError(r.status, text)
         logger.info("delete_contact_api: [%s, %s]", list_id[:12], elem_id[:12])
 
+    async def delete_contacts_bulk_api(
+        self,
+        session: Session,
+        list_id: str,
+        elem_ids: list[str],
+    ) -> None:
+        """Bulk-delete kontaktów przez eraseMultiple (DELETE ?ids=id1,id2,...).
+
+        Odpowiednik eraseMultiple() z EntityRestClient.ts — jeden request HTTP
+        zamiast jednego per kontakt.
+        """
+        if not elem_ids:
+            return
+        url = self._url("tutanota", "contact", list_id)
+        headers = {"accessToken": session.access_token, **TUTANOTA_HEADERS}
+        params = {"ids": ",".join(elem_ids)}
+        async with self._http.delete(url, headers=headers, params=params) as r:
+            if r.status not in (200, 204):
+                text = await r.text()
+                raise TutaAPIError(r.status, text)
+        logger.info(
+            "delete_contacts_bulk_api: [%s] × %d ids",
+            list_id[:12], len(elem_ids),
+        )
+
 
 def _random_custom_id() -> str:
     """Generuje losowy CustomId (base64url, 4 bajty = 6 znaków) — format jak w importerze Tuty."""

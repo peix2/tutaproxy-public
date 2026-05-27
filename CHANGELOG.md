@@ -7,6 +7,19 @@ Versioning: [Semantic Versioning](https://semver.org/) — MAJOR.MINOR.PATCH.
 
 ---
 
+## [1.2.1] — 2026-05-27
+
+### Fixed
+- **Bulk contact delete no longer stalls** — deleting many contacts at once (e.g. select-all
+  in CardBook) previously stopped after ~100 deletions and required a manual sync to continue.
+  Root cause: each DELETE triggered a separate Tuta API call; CardBook's per-cycle operation
+  limit was hit quickly. Fixed by batching concurrent DELETE requests: handlers arriving within
+  150 ms of each other are collected and sent as a single `eraseMultiple` call
+  (`DELETE /rest/tutanota/contact/{listId}?ids=id1,id2,...`), matching the endpoint used by
+  Tuta's own clients. Bulk delete now runs continuously without pausing.
+
+---
+
 ## [1.2.0] — 2026-05-27
 
 ### Added

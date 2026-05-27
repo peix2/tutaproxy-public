@@ -41,6 +41,11 @@ from .api import (
     ContactAddress,
 )
 
+# Czas oczekiwania na kolejne DELETE zanim wyślemy batch do Tuty (sekundy).
+# CardBook wysyła ~6 równoległych DELETEów; 150 ms wystarczy by zebrać całą
+# paczkę, ale nie spowalnia widocznie pojedynczego usunięcia.
+DELETE_BATCH_WINDOW = 0.15
+
 logger = logging.getLogger(__name__)
 
 CACHE_TTL = 60  # sekundy
@@ -381,6 +386,14 @@ class _CacheEntry:
     key_version: str
 
 
+@dataclass
+class _DeleteBatch:
+    """Grupuje równoległe DELETE requests jednego usera w jeden eraseMultiple call."""
+    items: list[tuple[str, str]]   # (list_id, elem_id)
+    event: asyncio.Event
+    error: Optional[Exception] = None
+
+
 # ---------------------------------------------------------------------------
 # Serwer CardDAV
 # ---------------------------------------------------------------------------
@@ -396,6 +409,12 @@ class CardDAVServer:
         self._login_locks: dict[str, asyncio.Lock] = {}
         self._cache: dict[str, _CacheEntry] = {}
         self._cache_lock = asyncio.Lock()
+        # Bufor batch-delete: username → _DeleteBatch.
+        # Każdy request DELETE rejestruje się w aktywnym batchu i czeka na event;
+        # timer po DELETE_BATCH_WINDOW s wywołuje flush, który wysyła eraseMultiple
+        # i ustawia event (wszystkie czekające DELETy wracają 204 naraz).
+        self._delete_batch: dict[str, "_DeleteBatch"] = {}
+        self._delete_locks: dict[str, asyncio.Lock] = {}
 
     async def start(self) -> None:
         server = await asyncio.start_server(self._handle_conn, self.host, self.port)
@@ -871,7 +890,7 @@ class CardDAVServer:
             return _text_resp(500, "Internal Server Error", str(e))
 
     # -----------------------------------------------------------------------
-    # DELETE
+    # DELETE — batched via eraseMultiple
     # -----------------------------------------------------------------------
 
     async def _handle_delete(
@@ -886,14 +905,68 @@ class CardDAVServer:
         if not c:
             return _text_resp(404, "Not Found")
 
-        try:
-            await client.delete_contact_api(session, c.list_id, c.elem_id)
-        except TutaAPIError as e:
-            logger.error("CardDAV DELETE error: %s", e)
-            return _text_resp(500, "Internal Server Error", str(e))
+        if username not in self._delete_locks:
+            self._delete_locks[username] = asyncio.Lock()
+
+        async with self._delete_locks[username]:
+            is_first = username not in self._delete_batch
+            if is_first:
+                self._delete_batch[username] = _DeleteBatch(
+                    items=[], event=asyncio.Event()
+                )
+            batch = self._delete_batch[username]
+            batch.items.append((c.list_id, c.elem_id))
+
+        if is_first:
+            # Pierwszy DELETE w tej paczce uruchamia timer flush.
+            loop = asyncio.get_event_loop()
+            loop.call_later(
+                DELETE_BATCH_WINDOW,
+                lambda: asyncio.ensure_future(
+                    self._flush_deletes(username, batch, session, client)
+                ),
+            )
+
+        # Każdy DELETE czeka aż flush wyśle batch i ustawi event.
+        await batch.event.wait()
+
+        if batch.error:
+            return _text_resp(500, "Internal Server Error", str(batch.error))
 
         self._invalidate(username)
         return HTTPResponse(204, "No Content", {})
+
+    async def _flush_deletes(
+        self,
+        username: str,
+        batch: "_DeleteBatch",
+        session,
+        client: TutaClient,
+    ) -> None:
+        """Wysyła zgromadzone DELETy jako jeden eraseMultiple i zwalnia czekające requesty."""
+        # Usuń batch ze słownika — nowe DELETy po tym punkcie dostaną nowy batch.
+        async with self._delete_locks[username]:
+            if self._delete_batch.get(username) is batch:
+                del self._delete_batch[username]
+
+        from collections import defaultdict
+        by_list: dict[str, list[str]] = defaultdict(list)
+        for list_id, elem_id in batch.items:
+            by_list[list_id].append(elem_id)
+
+        for list_id, elem_ids in by_list.items():
+            try:
+                logger.info(
+                    "CardDAV batch DELETE: %d kontaktów z listy %s",
+                    len(elem_ids), list_id[:12],
+                )
+                await client.delete_contacts_bulk_api(session, list_id, elem_ids)
+            except Exception as e:
+                logger.error("CardDAV batch DELETE error: %s", e)
+                batch.error = e
+                break
+
+        batch.event.set()
 
 
 # ---------------------------------------------------------------------------
