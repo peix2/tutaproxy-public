@@ -22,10 +22,11 @@ Tuta is a privacy-focused email service with strong end-to-end encryption. It on
 - **Import from other accounts** — copy or move messages from Gmail or any other IMAP account into Tuta (with attachments); messages land in Inbox as properly encrypted Tuta mail
 - **Folder management** — create, rename, delete folders; move messages between folders (IMAP COPY)
 - **CalDAV (calendar sync)** — CalDAV server exposes your Tuta calendars to any CalDAV client (Thunderbird, Apple Calendar, etc.); supports reading, creating, updating, and deleting events; recurrence rules (RRULE) fully supported
+- **CardDAV (contact sync)** — CardDAV server exposes your Tuta contacts to any CardDAV client (CardBook for Thunderbird, Apple Contacts, etc.); supports reading, creating, updating, and deleting contacts (vCard 3.0)
 - **Push updates** — IMAP IDLE support so your client gets notified of new mail without polling
 - **Flags** — read/unread, deleted (with EXPUNGE)
 - **SQLite cache** — folder list and message IDs are cached locally to speed up reconnects
-- **Docker-ready** — single container runs IMAP, SMTP, and CalDAV
+- **Docker-ready** — single container runs IMAP, SMTP, CalDAV, and CardDAV
 
 ---
 
@@ -44,10 +45,11 @@ cd tutaproxy-public/docker
 docker-compose up -d --build
 ```
 
-All three servers start automatically:
+All four servers start automatically:
 - IMAP on `127.0.0.1:1143`
 - SMTP on `127.0.0.1:1025`
 - CalDAV on `127.0.0.1:5232`
+- CardDAV on `127.0.0.1:5233`
 
 Cache is stored in a Docker volume and survives container restarts.
 
@@ -62,13 +64,14 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 
-# Start IMAP, SMTP, and CalDAV:
+# Start IMAP, SMTP, CalDAV, and CardDAV:
 python run_proxy.py
 
 # Or start separately:
 python run_imap.py
 python run_smtp.py
 python run_caldav.py
+python run_carddav.py
 ```
 
 ### Environment variables
@@ -81,6 +84,8 @@ python run_caldav.py
 | `TUTA_SMTP_PORT` | `1025` | SMTP port |
 | `TUTA_CALDAV_HOST` | `0.0.0.0` (proxy) / `127.0.0.1` (standalone) | CalDAV bind address |
 | `TUTA_CALDAV_PORT` | `5232` | CalDAV port |
+| `TUTA_CARDDAV_HOST` | `0.0.0.0` (proxy) / `127.0.0.1` (standalone) | CardDAV bind address |
+| `TUTA_CARDDAV_PORT` | `5233` | CardDAV port |
 | `TUTA_CACHE_PATH` | `tuta_cache.db` | SQLite cache file path |
 | `LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR` |
 | `TUTA_SYS_VERSION` | `150` | Tuta sys model version (override after API update) |
@@ -138,6 +143,32 @@ Use your full Tuta email address as the username and your Tuta password.
 2. Account type: **Manual**, server: `http://localhost:5232/`.
 3. Username: your Tuta email, password: your Tuta password.
 
+---
+
+## CardDAV Setup (contact sync)
+
+The proxy exposes a CardDAV server on port `5233`. Point your contacts client to:
+
+```
+http://localhost:5233/
+```
+
+Use your full Tuta email address as the username and your Tuta password.
+
+### CardBook (Thunderbird add-on)
+
+[CardBook](https://addons.thunderbird.net/en-US/thunderbird/addon/cardbook/) is a separate Thunderbird add-on for CardDAV — it is not the same as Thunderbird's built-in address book.
+
+1. Install the [CardBook](https://addons.thunderbird.net/en-US/thunderbird/addon/cardbook/) add-on.
+2. In CardBook → Address Book → Add an address book → Remote → CardDAV.
+3. URL: `http://localhost:5233/`, username: your Tuta email, password: your Tuta password.
+4. **Important:** on the last step of the wizard, check **"Available offline"** (or similar wording). Without this option, CardBook treats the address book as read-only and will not send PUT or DELETE requests even though the server advertises write access.
+
+### Apple Contacts
+
+1. System Settings → Internet Accounts → Add Account → Other → CardDAV account.
+2. Account type: **Manual**, server: `http://localhost:5233/`.
+3. Username: your Tuta email, password: your Tuta password.
 
 ---
 

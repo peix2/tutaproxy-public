@@ -6,13 +6,14 @@ services:
     image: tutaproxy:latest
     restart: unless-stopped
     ports:
-      - "127.0.0.1:1143:1143"   # IMAP   — tylko localhost hosta, nie z sieci
-      - "127.0.0.1:1025:1025"   # SMTP   — tylko localhost hosta, nie z sieci
-      - "127.0.0.1:5232:5232"   # CalDAV — tylko localhost hosta, nie z sieci
+      - "127.0.0.1:1143:1143"    # IMAP    — tylko localhost hosta, nie z sieci
+      - "127.0.0.1:1025:1025"    # SMTP    — tylko localhost hosta, nie z sieci
+      - "127.0.0.1:5232:5232"    # CalDAV  — tylko localhost hosta, nie z sieci
+      - "127.0.0.1:5233:5233"    # CardDAV — tylko localhost hosta, nie z sieci
     volumes:
       - tuta_cache:/data
     environment:
-      LOG_LEVEL: DEBUG
+      LOG_LEVEL: INFO
       # Gdy Tuta zbumpuje wersję API, nadpisz tu bez przebudowania obrazu:
       # TUTA_SYS_VERSION: "150"
       # TUTA_TUTANOTA_VERSION: "108"

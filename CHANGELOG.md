@@ -7,6 +7,21 @@ Versioning: [Semantic Versioning](https://semver.org/) — MAJOR.MINOR.PATCH.
 
 ---
 
+## [1.2.0] — 2026-05-27
+
+### Added
+- **CardDAV server** — CardDAV server on port `5233` exposes all Tuta contacts to standard
+  contacts clients (CardBook for Thunderbird, Apple Contacts, etc.). Supports read, create,
+  update, and delete. Contacts are exported and imported as vCard 3.0, including email
+  addresses, phone numbers, postal addresses, websites, and birthday. Use your Tuta
+  credentials to authenticate.
+- `run_carddav.py` — standalone entry point for the CardDAV server.
+
+### Fixed
+- Proxy (`run_proxy.py`) now starts CardDAV alongside IMAP, SMTP, and CalDAV.
+
+---
+
 ## [1.1.0] — 2026-05-27
 
 ### Added

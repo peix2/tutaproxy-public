@@ -2569,6 +2569,357 @@ class TutaClient:
                 raise TutaAPIError(r.status, text)
         logger.info("delete_calendar_event_api: [%s, %s]", list_id[:12], elem_id[:12])
 
+    # -----------------------------------------------------------------------
+    # Kontakty
+    # -----------------------------------------------------------------------
+
+    async def get_contact_group_info(
+        self, session: Session
+    ) -> "tuple[str, bytes, str, str]":
+        """
+        Zwraca (list_id, contact_group_key, group_id, key_version).
+        list_id = ID listy kontaktów w Tucie.
+        """
+        user_data = await self._get(
+            self._url("sys", "user", session.user_id),
+            token=session.access_token,
+        )
+        contact_group_key: Optional[bytes] = None
+        group_id = ""
+        key_version = "0"
+        memberships = user_data.get("96", [])
+        logger.debug("get_contact_group_info: dostępne groupType: %s",
+                     [m.get("1030") for m in memberships if isinstance(m, dict)])
+        for m in memberships:
+            if m.get("1030") == "6":  # Contact group (nie "11" = ContactList, to enterprise shared lists)
+                enc_key = base64.b64decode(m.get("27", ""))
+                g = m.get("29", "")
+                group_id = g[-1] if isinstance(g, list) else g
+                key_version = str(m.get("2246", "0") or "0")
+                contact_group_key = aes_decrypt_tuta(session.user_group_key, enc_key)
+                break
+        if contact_group_key is None or not group_id:
+            logger.error("get_contact_group_info: brak groupType=6, dostępne: %s",
+                         [m.get("1030") for m in memberships if isinstance(m, dict)])
+            raise TutaAPIError(0, "Nie znaleziono grupy kontaktów (groupType=6)")
+
+        if not session.user_group_id:
+            raise TutaAPIError(0, "user_group_id niedostępny")
+        # loadRoot(ContactListTypeRef, user.userGroup.group):
+        #   1. GET /rest/sys/rootinstance/{user_group_id}/CHR1dGFub3RhAACZ → reference
+        #   2. GET /rest/tutanota/contactlist/{reference} → pole 160 = contacts list_id
+        CONTACT_LIST_ROOT_ID = "CHR1dGFub3RhAACZ"
+        ri_url = self._url("sys", "rootinstance", session.user_group_id, CONTACT_LIST_ROOT_ID)
+        logger.debug("get_contact_group_info: rootinstance URL=%s", ri_url)
+        root_instance = await self._get(ri_url, token=session.access_token)
+        contact_list_elem_id = root_instance.get("236", "")
+        if not contact_list_elem_id:
+            raise TutaAPIError(0, "Brak reference w RootInstance ContactList")
+        contact_list = await self._get_tutanota(
+            self._url("tutanota", "contactlist", contact_list_elem_id),
+            token=session.access_token,
+        )
+        list_id = contact_list.get("160", "")
+        if isinstance(list_id, list):
+            list_id = list_id[-1] if list_id else ""
+        if not list_id:
+            raise TutaAPIError(0, "Brak contacts list_id w ContactList")
+
+        logger.debug("contact list_id=%s group_id=%s kv=%s", list_id[:12], group_id[:12], key_version)
+        return list_id, contact_group_key, group_id, key_version
+
+    async def get_contacts(self, session: Session) -> "list[Contact]":
+        """Pobiera i odszyfrowuje wszystkie kontakty użytkownika."""
+        list_id, contact_group_key, _gid, _kv = await self.get_contact_group_info(session)
+        contacts: list[Contact] = []
+        start = "AAAAAAAAAAAA"
+        raw_total = 0
+        for _ in range(200):  # max ~100 000 kontaktów (strony po 500)
+            page = await self._get_tutanota(
+                self._url("tutanota", "contact", list_id),
+                token=session.access_token,
+                params={"start": start, "count": "500", "reverse": "false"},
+            )
+            if not isinstance(page, list) or not page:
+                break
+            raw_total += len(page)
+            for raw in page:
+                c = self._decrypt_contact(raw, contact_group_key)
+                if c:
+                    contacts.append(c)
+            if len(page) < 500:
+                break
+            last_raw_id = page[-1].get("66", "")
+            if isinstance(last_raw_id, list):
+                last_raw_id = last_raw_id[-1] if last_raw_id else ""
+            start = last_raw_id or "AAAAAAAAAAAA"
+
+        logger.info("Pobrano %d kontaktów (raw: %d)", len(contacts), raw_total)
+        return contacts
+
+    def _decrypt_contact(self, raw: dict, contact_group_key: bytes) -> "Optional[Contact]":
+        """Odszyfrowuje pojedynczy Contact. Zwraca None przy błędzie."""
+        try:
+            enc_sk_b64 = raw.get("69", "")
+            if not enc_sk_b64:
+                return None
+            sk = aes_decrypt_tuta(contact_group_key, base64.b64decode(enc_sk_b64))
+
+            def d(fid: str) -> str:
+                v = raw.get(fid, "")
+                if not v:
+                    return ""
+                try:
+                    return aes_decrypt_tuta(sk, base64.b64decode(v)).decode("utf-8")
+                except Exception:
+                    return ""
+
+            def da(obj: dict, fid: str) -> str:
+                v = obj.get(fid, "")
+                if not v:
+                    return ""
+                try:
+                    return aes_decrypt_tuta(sk, base64.b64decode(v)).decode("utf-8")
+                except Exception:
+                    return ""
+
+            raw_id = raw.get("66", "")
+            if isinstance(raw_id, list) and len(raw_id) == 2:
+                c_list_id, elem_id = raw_id[0], raw_id[1]
+            else:
+                c_list_id, elem_id = "", str(raw_id)
+
+            mail_addresses = [
+                ContactMailAddress(
+                    _id=m.get("45", ""),
+                    type=da(m, "46") or "2",
+                    custom_type=da(m, "48"),
+                    address=da(m, "47"),
+                )
+                for m in (raw.get("80") or []) if isinstance(m, dict)
+            ]
+            phone_numbers = [
+                ContactPhoneNumber(
+                    _id=p.get("50", ""),
+                    type=da(p, "51") or "4",
+                    custom_type=da(p, "53"),
+                    number=da(p, "52"),
+                )
+                for p in (raw.get("81") or []) if isinstance(p, dict)
+            ]
+            addresses = [
+                ContactAddress(
+                    _id=a.get("55", ""),
+                    type=da(a, "56") or "2",
+                    custom_type=da(a, "58"),
+                    address=da(a, "57"),
+                )
+                for a in (raw.get("82") or []) if isinstance(a, dict)
+            ]
+            websites = [
+                (da(w, "1363") or "2", da(w, "1365"))
+                for w in (raw.get("1387") or [])
+                if isinstance(w, dict) and da(w, "1365")
+            ]
+            social_ids = [
+                (da(s, "61") or "4", da(s, "62"))
+                for s in (raw.get("83") or [])
+                if isinstance(s, dict) and da(s, "62")
+            ]
+
+            return Contact(
+                list_id=c_list_id,
+                elem_id=elem_id,
+                first_name=d("72"),
+                last_name=d("73"),
+                middle_name=d("1380"),
+                title=d("850"),
+                name_suffix=d("1381"),
+                nickname=d("849"),
+                company=d("74"),
+                department=d("1385"),
+                role=d("75"),
+                mail_addresses=mail_addresses,
+                phone_numbers=phone_numbers,
+                addresses=addresses,
+                websites=websites,
+                social_ids=social_ids,
+                birthday_iso=d("1083"),
+                comment=d("77"),
+            )
+        except Exception as exc:
+            logger.warning("_decrypt_contact: błąd — %s", exc)
+            return None
+
+    def _enc_contact_body(
+        self,
+        contact: "Contact",
+        sk: bytes,
+        group_id: str,
+        owner_enc_sk: bytes,
+        key_version: str,
+        existing_raw: Optional[dict] = None,
+    ) -> dict:
+        """Buduje zaszyfrowany JSON kontaktu dla POST/PUT."""
+        def enc(text: str) -> str:
+            return base64.b64encode(
+                aes_encrypt_tuta(sk, (text or "").encode("utf-8"), add_padding=True)
+            ).decode()
+
+        def enc_or_null(text: str) -> Optional[str]:
+            return enc(text) if text else None
+
+        def enc_mail(m: "ContactMailAddress") -> dict:
+            return {"45": m._id or _random_custom_id(), "46": enc(m.type),
+                    "47": enc(m.address), "48": enc(m.custom_type)}
+
+        def enc_phone(p: "ContactPhoneNumber") -> dict:
+            return {"50": p._id or _random_custom_id(), "51": enc(p.type),
+                    "52": enc(p.number), "53": enc(p.custom_type)}
+
+        def enc_addr(a: "ContactAddress") -> dict:
+            return {"55": a._id or _random_custom_id(), "56": enc(a.type),
+                    "57": enc(a.address), "58": enc(a.custom_type)}
+
+        def enc_website(w: tuple) -> dict:
+            t, url = w
+            return {"1362": _random_custom_id(), "1363": enc(t), "1364": enc(""), "1365": enc(url)}
+
+        def enc_social(s: tuple) -> dict:
+            t, sid = s
+            return {"60": _random_custom_id(), "61": enc(t), "62": enc(sid), "63": enc("")}
+
+        return {
+            "66": [contact.list_id, contact.elem_id] if contact.list_id and contact.elem_id else None,
+            "67": existing_raw.get("67") if existing_raw else None,  # _permissions
+            "68": "0",
+            "69": base64.b64encode(owner_enc_sk).decode(),
+            "72": enc(contact.first_name),
+            "73": enc(contact.last_name),
+            "74": enc(contact.company),
+            "75": enc(contact.role),
+            "76": existing_raw.get("76") if existing_raw else None,  # oldBirthdayDate (deprecated, preserve on update)
+            "77": enc(contact.comment),
+            "79": None,  # presharedPassword
+            "80": [enc_mail(m) for m in contact.mail_addresses],
+            "81": [enc_phone(p) for p in contact.phone_numbers],
+            "82": [enc_addr(a) for a in contact.addresses],
+            "83": [enc_social(s) for s in contact.social_ids],
+            "585": existing_raw.get("585") if existing_raw else group_id,  # _ownerGroup
+            "849": enc_or_null(contact.nickname),
+            "850": enc_or_null(contact.title),
+            "851": [],   # oldBirthdayAggregate (ZeroOrOne AGGREGATION → [] when absent)
+            # photo: LIST_ELEMENT_ASSOCIATION ZeroOrOne — Tuta wymaga [] gdy brak, nie null
+            "852": (existing_raw.get("852") or []) if existing_raw else [],
+            "1083": enc_or_null(contact.birthday_iso),
+            "1380": enc_or_null(contact.middle_name),
+            "1381": enc_or_null(contact.name_suffix),
+            "1382": None, "1383": None, "1384": None,  # phonetic fields
+            "1385": enc_or_null(contact.department),
+            "1386": [],  # customDate
+            "1387": [enc_website(w) for w in contact.websites],
+            "1388": [],  # relationships
+            "1389": [],  # messengerHandles
+            "1390": [],  # pronouns
+            # FINAL fields — przy update zachowujemy wartości z istniejącego rekordu
+            "1394": existing_raw.get("1394", key_version) if existing_raw else key_version,  # _ownerKeyVersion
+            "1837": existing_raw.get("1837") if existing_raw else None,  # _kdfNonce (FINAL)
+        }
+
+    async def create_contact_api(
+        self,
+        session: Session,
+        contact: "Contact",
+        list_id: str,
+        contact_group_key: bytes,
+        group_id: str,
+        key_version: str = "0",
+    ) -> "tuple[str, str]":
+        """Tworzy nowy kontakt w Tucie. Zwraca (list_id, elem_id) nowego kontaktu."""
+        sk = os.urandom(32)
+        owner_enc_sk = aes_encrypt_tuta(contact_group_key, sk, add_padding=False)
+        body = self._enc_contact_body(contact, sk, group_id, owner_enc_sk, key_version)
+
+        # setupMultiple — Tuta wymaga tablicy + ?count=N (tak samo jak CalendarEvent)
+        url = self._url("tutanota", "contact", list_id)
+        headers = {"accessToken": session.access_token, **TUTANOTA_HEADERS}
+        logger.debug("create_contact_api: body keys=%s", list(body.keys()))
+        async with self._http.post(url, json=[body], headers=headers,
+                                   params={"count": "1"}) as r:
+            if r.status not in (200, 201):
+                text = await r.text()
+                resp_hdrs = dict(r.headers)
+                logger.error("create_contact_api: HTTP %d hdrs=%s — %r", r.status, resp_hdrs, text[:800])
+                raise TutaAPIError(r.status, text)
+            resp = await r.json()
+
+        # setupMultiple zwraca listę PersistenceResourcePostReturn:
+        # [{'1': '0', '2': generatedId, '3': permissionListId}, ...]
+        if isinstance(resp, list) and resp:
+            entry = resp[0]
+            if isinstance(entry, dict):
+                new_id = entry.get("2") or str(entry)
+            elif isinstance(entry, list):
+                new_id = entry[-1]
+            else:
+                new_id = str(entry)
+        else:
+            new_id = str(resp)
+        logger.info("create_contact_api: → [%s, %s]", list_id[:12], new_id[:12])
+        return list_id, new_id
+
+    async def update_contact_api(
+        self,
+        session: Session,
+        contact: "Contact",
+        contact_group_key: bytes,
+        key_version: str = "0",
+    ) -> None:
+        """Aktualizuje istniejący kontakt przez PUT."""
+        if not contact.list_id or not contact.elem_id:
+            raise TutaAPIError(0, "Kontakt bez list_id/elem_id — nie można zaktualizować")
+
+        url = self._url("tutanota", "contact", contact.list_id, contact.elem_id)
+        headers = {"accessToken": session.access_token, **TUTANOTA_HEADERS}
+        raw = await self._get_tutanota(url, token=session.access_token)
+
+        logger.debug("update_contact_api: raw keys=%s", sorted(raw.keys()))
+        # Reużywamy istniejący klucz sesji zamiast generować nowy
+        enc_sk_b64 = raw.get("69", "")
+        if enc_sk_b64:
+            sk = aes_decrypt_tuta(contact_group_key, base64.b64decode(enc_sk_b64))
+            owner_enc_sk = base64.b64decode(enc_sk_b64)
+        else:
+            sk = os.urandom(32)
+            owner_enc_sk = aes_encrypt_tuta(contact_group_key, sk, add_padding=False)
+        body = self._enc_contact_body(
+            contact, sk, raw.get("585", ""), owner_enc_sk, key_version, existing_raw=raw
+        )
+
+        logger.debug("update_contact_api: body keys=%s", list(body.keys()))
+        async with self._http.put(url, json=body, headers=headers) as r:
+            if r.status not in (200, 204):
+                text = await r.text()
+                resp_hdrs = dict(r.headers)
+                logger.error("update_contact_api: HTTP %d hdrs=%s — %r", r.status, resp_hdrs, text[:800])
+                raise TutaAPIError(r.status, text)
+        logger.info("update_contact_api: [%s, %s]", contact.list_id[:12], contact.elem_id[:12])
+
+    async def delete_contact_api(
+        self,
+        session: Session,
+        list_id: str,
+        elem_id: str,
+    ) -> None:
+        """Usuwa kontakt przez REST DELETE."""
+        url = self._url("tutanota", "contact", list_id, elem_id)
+        headers = {"accessToken": session.access_token, **TUTANOTA_HEADERS}
+        async with self._http.delete(url, headers=headers) as r:
+            if r.status not in (200, 204):
+                text = await r.text()
+                raise TutaAPIError(r.status, text)
+        logger.info("delete_contact_api: [%s, %s]", list_id[:12], elem_id[:12])
+
 
 def _random_custom_id() -> str:
     """Generuje losowy CustomId (base64url, 4 bajty = 6 znaków) — format jak w importerze Tuty."""
@@ -2628,6 +2979,63 @@ class CalendarEvent:
     list_id: str = ""   # _id[0] — shortEvents lub longEvents list ID
     elem_id: str = ""   # _id[1] — CustomId elementu w liście
     rrule: Optional["RepeatRule"] = None
+
+
+# ---------------------------------------------------------------------------
+# Kontakty
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ContactMailAddress:
+    # type: "0"=PRIVATE, "1"=WORK, "2"=OTHER, "3"=CUSTOM
+    type: str
+    custom_type: str
+    address: str
+    _id: str = ""
+
+
+@dataclass
+class ContactPhoneNumber:
+    # type: "0"=PRIVATE, "1"=WORK, "2"=MOBILE, "3"=FAX, "4"=OTHER, "5"=CUSTOM
+    type: str
+    custom_type: str
+    number: str
+    _id: str = ""
+
+
+@dataclass
+class ContactAddress:
+    # type: "0"=PRIVATE, "1"=WORK, "2"=OTHER, "3"=CUSTOM
+    type: str
+    custom_type: str
+    address: str     # może być wieloliniowy
+    _id: str = ""
+
+
+@dataclass
+class Contact:
+    list_id: str = ""
+    elem_id: str = ""
+    # imię/nazwisko
+    first_name: str = ""
+    last_name: str = ""
+    middle_name: str = ""
+    title: str = ""          # grzecznościowy (Dr, Pan, etc.)
+    name_suffix: str = ""
+    nickname: str = ""
+    # zawodowe
+    company: str = ""
+    department: str = ""
+    role: str = ""           # stanowisko (job title)
+    # dane kontaktowe
+    mail_addresses: list = field(default_factory=list)   # list[ContactMailAddress]
+    phone_numbers: list = field(default_factory=list)    # list[ContactPhoneNumber]
+    addresses: list = field(default_factory=list)        # list[ContactAddress]
+    websites: list = field(default_factory=list)         # list[tuple[str, str]] (type, url)
+    social_ids: list = field(default_factory=list)       # list[tuple[str, str]] (type, socialId)
+    # pozostałe
+    birthday_iso: str = ""
+    comment: str = ""
 
 
 # ---------------------------------------------------------------------------
