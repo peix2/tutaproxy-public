@@ -3,13 +3,15 @@ run_proxy.py
 Uruchamia IMAP i SMTP proxy jednocześnie w jednej pętli asyncio.
 
 Zmienne środowiskowe:
-    TUTA_IMAP_HOST   — domyślnie 0.0.0.0
-    TUTA_IMAP_PORT   — domyślnie 1143
-    TUTA_SMTP_HOST   — domyślnie 0.0.0.0
-    TUTA_SMTP_PORT   — domyślnie 1025
-    TUTA_CACHE_PATH  — domyślnie /data/tuta_cache.db
-    LOG_LEVEL        — domyślnie INFO
-    LOG_FILE         — jeśli ustawiony, logi tylko do pliku
+    TUTA_IMAP_HOST     — domyślnie 0.0.0.0
+    TUTA_IMAP_PORT     — domyślnie 1143
+    TUTA_SMTP_HOST     — domyślnie 0.0.0.0
+    TUTA_SMTP_PORT     — domyślnie 1025
+    TUTA_CALDAV_HOST   — domyślnie 0.0.0.0
+    TUTA_CALDAV_PORT   — domyślnie 5232
+    TUTA_CACHE_PATH    — domyślnie /data/tuta_cache.db
+    LOG_LEVEL          — domyślnie INFO
+    LOG_FILE           — jeśli ustawiony, logi tylko do pliku
 """
 
 import asyncio
@@ -54,25 +56,30 @@ logging.basicConfig(
 
 from tuta.imap_server import IMAPServer
 from tuta.smtp_server import SMTPServer
+from tuta.caldav_server import CalDAVServer
 
 
 async def main() -> None:
-    imap_host = os.environ.get("TUTA_IMAP_HOST", "0.0.0.0")
-    imap_port = int(os.environ.get("TUTA_IMAP_PORT", "1143"))
-    smtp_host = os.environ.get("TUTA_SMTP_HOST", "0.0.0.0")
-    smtp_port = int(os.environ.get("TUTA_SMTP_PORT", "1025"))
-    cache_path = os.environ.get("TUTA_CACHE_PATH", "/data/tuta_cache.db")
+    imap_host   = os.environ.get("TUTA_IMAP_HOST",   "0.0.0.0")
+    imap_port   = int(os.environ.get("TUTA_IMAP_PORT",   "1143"))
+    smtp_host   = os.environ.get("TUTA_SMTP_HOST",   "0.0.0.0")
+    smtp_port   = int(os.environ.get("TUTA_SMTP_PORT",   "1025"))
+    caldav_host = os.environ.get("TUTA_CALDAV_HOST", "0.0.0.0")
+    caldav_port = int(os.environ.get("TUTA_CALDAV_PORT", "5232"))
+    cache_path  = os.environ.get("TUTA_CACHE_PATH",  "/data/tuta_cache.db")
 
-    imap = IMAPServer(host=imap_host, port=imap_port, cache_path=cache_path)
-    smtp = SMTPServer(host=smtp_host, port=smtp_port)
+    imap   = IMAPServer(host=imap_host, port=imap_port, cache_path=cache_path)
+    smtp   = SMTPServer(host=smtp_host, port=smtp_port)
+    caldav = CalDAVServer(host=caldav_host, port=caldav_port)
 
-    print(f"tuta-proxy IMAP  {imap_host}:{imap_port}")
-    print(f"tuta-proxy SMTP  {smtp_host}:{smtp_port}")
+    print(f"tuta-proxy IMAP   {imap_host}:{imap_port}")
+    print(f"tuta-proxy SMTP   {smtp_host}:{smtp_port}")
+    print(f"tuta-proxy CalDAV {caldav_host}:{caldav_port}")
     print(f"cache: {cache_path}")
     print("Zatrzymaj: Ctrl+C")
 
     try:
-        await asyncio.gather(imap.start(), smtp.start())
+        await asyncio.gather(imap.start(), smtp.start(), caldav.start())
     except asyncio.CancelledError:
         pass
     finally:

@@ -21,10 +21,11 @@ Tuta is a privacy-focused email service with strong end-to-end encryption. It on
 - **Attachments** — download and upload, including inline images
 - **Import from other accounts** — copy or move messages from Gmail or any other IMAP account into Tuta (with attachments); messages land in Inbox as properly encrypted Tuta mail
 - **Folder management** — create, rename, delete folders; move messages between folders (IMAP COPY)
+- **CalDAV (calendar sync)** — read-only CalDAV server exposes your Tuta calendars to any CalDAV client (Thunderbird, Apple Calendar, etc.); events include recurrence rules (RRULE)
 - **Push updates** — IMAP IDLE support so your client gets notified of new mail without polling
 - **Flags** — read/unread, deleted (with EXPUNGE)
 - **SQLite cache** — folder list and message IDs are cached locally to speed up reconnects
-- **Docker-ready** — single container runs both IMAP and SMTP
+- **Docker-ready** — single container runs IMAP, SMTP, and CalDAV
 
 ---
 
@@ -43,9 +44,10 @@ cd tutaproxy-public/docker
 docker-compose up -d --build
 ```
 
-Both servers start automatically:
+All three servers start automatically:
 - IMAP on `127.0.0.1:1143`
 - SMTP on `127.0.0.1:1025`
+- CalDAV on `127.0.0.1:5232`
 
 Cache is stored in a Docker volume and survives container restarts.
 
@@ -60,12 +62,13 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 
-# Start both IMAP and SMTP:
+# Start IMAP, SMTP, and CalDAV:
 python run_proxy.py
 
 # Or start separately:
 python run_imap.py
 python run_smtp.py
+python run_caldav.py
 ```
 
 ### Environment variables
@@ -76,6 +79,8 @@ python run_smtp.py
 | `TUTA_IMAP_PORT` | `1143` | IMAP port |
 | `TUTA_SMTP_HOST` | `0.0.0.0` (proxy) / `127.0.0.1` (standalone) | SMTP bind address |
 | `TUTA_SMTP_PORT` | `1025` | SMTP port |
+| `TUTA_CALDAV_HOST` | `0.0.0.0` (proxy) / `127.0.0.1` (standalone) | CalDAV bind address |
+| `TUTA_CALDAV_PORT` | `5232` | CalDAV port |
 | `TUTA_CACHE_PATH` | `tuta_cache.db` | SQLite cache file path |
 | `LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR` |
 | `TUTA_SYS_VERSION` | `150` | Tuta sys model version (override after API update) |
@@ -104,6 +109,36 @@ python run_smtp.py
 4. **Credentials** — use your full Tuta email address as the username and your Tuta password.
 
 > The proxy runs entirely on localhost. Your credentials are used once to authenticate with Tuta's API per session and are never stored on disk.
+
+---
+
+## CalDAV Setup (calendar sync)
+
+The proxy exposes a read-only CalDAV server on port `5232`. Point your calendar client to:
+
+```
+http://localhost:5232/
+```
+
+Use your full Tuta email address as the username and your Tuta password.
+
+### Thunderbird (via TbSync + Provider for CalDAV & CardDAV)
+
+1. Install the [TbSync](https://addons.thunderbird.net/en-US/thunderbird/addon/tbsync/) and [Provider for CalDAV & CardDAV](https://addons.thunderbird.net/en-US/thunderbird/addon/dav-4-tbsync/) add-ons.
+2. In TbSync → Account actions → Add new account → CalDAV & CardDAV.
+3. Choose **Manual configuration**:
+   - CalDAV server: `http://localhost:5232/`
+   - Username: your Tuta email address
+   - Password: your Tuta password
+4. Synchronize — your Tuta calendars appear in Thunderbird.
+
+### Apple Calendar
+
+1. System Settings → Internet Accounts → Add Account → Other → CalDAV account.
+2. Account type: **Manual**, server: `http://localhost:5232/`.
+3. Username: your Tuta email, password: your Tuta password.
+
+> **Note:** CalDAV is currently read-only. Creating or editing events from the calendar client is not supported — changes must be made in the Tuta app.
 
 ---
 

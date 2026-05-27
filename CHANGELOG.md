@@ -7,6 +7,30 @@ Versioning: [Semantic Versioning](https://semver.org/) — MAJOR.MINOR.PATCH.
 
 ---
 
+## [1.1.0] — 2026-05-27
+
+### Added
+- **CalDAV server** — read-only CalDAV server on port `5232` exposes all Tuta calendars
+  to standard calendar clients (Thunderbird via TbSync, Apple Calendar, etc.).
+  Events include full recurrence support (RRULE), timezone handling, and all standard
+  iCalendar fields. Use your Tuta credentials to authenticate.
+
+### Fixed
+- **Secure External replies now appear in Thunderbird automatically** — previously a reply
+  sent from Tuta's Secure External portal would only appear in Thunderbird after the user
+  opened the mail in Tuta's web app first. Root cause: a 2–3 second WebSocket gap between
+  consecutive IMAP IDLE sessions during which Tuta's CREATE event arrived and was silently
+  dropped. Fixed by running a persistent background WebSocket watcher for the entire IMAP
+  session that buffers events in a queue; IDLE and NOOP drain from that queue instead of
+  opening a new WebSocket per session.
+- **PQ decaps graceful failure** — Tuta briefly sets field `2045` (`pubEncBucketKey`) to
+  `null` in JSON while processing new mail. Previously this caused a `TypeError: a bytes-like
+  object is required, not 'NoneType'` crash. Now fails with a descriptive `ValueError` that
+  the FETCH handler catches and recovers from; the subsequent UPDATE event delivers the mail
+  with complete fields.
+
+---
+
 ## [1.0.2] — 2026-05-26
 
 ### Added

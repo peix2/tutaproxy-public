@@ -585,6 +585,9 @@ class TutaClient:
                 if mail_ref:
                     bag_to_elem_ids.setdefault(mail_ref[0], set()).add(mail_ref[1])
                     entry_count += 1
+                else:
+                    logger.warning("get_mails_in_folder: nieznany format 1456=%r (entry._id=%r)",
+                                   mail_ref_raw, entry.get("1452"))
             if len(entries) < 200:
                 break
             # _id (1452) = IdTuple [listId, elemId] — używamy elemId jako kursora
@@ -2186,9 +2189,445 @@ class TutaClient:
         logger.info(f"send_draft_e2e: draft {draft_elem_id} sent E2E → {len(recipients)} odbiorców")
 
 
+    # -----------------------------------------------------------------------
+    # Kalendarz
+    # -----------------------------------------------------------------------
+
+    async def get_calendar_group_key(self, session: Session) -> tuple[str, bytes, str]:
+        """
+        Zwraca (calendar_group_id, calendar_group_key, cal_key_version).
+        cal_key_version = wersja klucza z GroupMembership (pole 2246).
+        """
+        user_data = await self._get(
+            self._url("sys", "user", session.user_id),
+            token=session.access_token,
+        )
+        for m in user_data.get("96", []):
+            if m.get("1030") == "9":  # calendar group
+                enc_key = base64.b64decode(m.get("27", ""))
+                g = m.get("29", "")
+                group_id = g[-1] if isinstance(g, list) else g
+                key_version = str(m.get("2246", "0") or "0")
+                cal_group_key = aes_decrypt_tuta(session.user_group_key, enc_key)
+                logger.debug("calendar_group_id=%s key=%s... kv=%s",
+                             group_id, cal_group_key.hex()[:16], key_version)
+                return group_id, cal_group_key, key_version
+        raise TutaAPIError(0, "Nie znaleziono grupy kalendarza (groupType=9)")
+
+    async def get_calendar_events(self, session: Session) -> list["CalendarEvent"]:
+        """
+        Pobiera i odszyfrowuje wszystkie eventy kalendarza.
+        CalendarGroupRoot → shortEvents (954) + longEvents (955) → CalendarEvent[].
+        """
+        cal_group_id, cal_group_key, _kv = await self.get_calendar_group_key(session)
+
+        root = await self._get_tutanota(
+            self._url("tutanota", "calendargrouproot", cal_group_id),
+            token=session.access_token,
+        )
+
+        events: list[CalendarEvent] = []
+        list_names = {"954": "shortEvents", "955": "longEvents"}
+        # 954 = shortEvents listId, 955 = longEvents listId (LIST_ASSOCIATION)
+        for field_id in ("954", "955"):
+            list_id = root.get(field_id, "")
+            if isinstance(list_id, list):
+                list_id = list_id[-1] if list_id else ""
+            if not list_id:
+                logger.debug("get_calendar_events: brak list_id dla pola %s (%s)", field_id, list_names[field_id])
+                continue
+
+            raw_count = 0
+            ok_count = 0
+            # Pobierz wszystkie eventy z listy (paginacja po 200)
+            start = "AAAAAAAAAAAA"
+            for _ in range(50):  # max 10 000 eventów
+                page = await self._get_tutanota(
+                    self._url("tutanota", "calendarevent", list_id),
+                    token=session.access_token,
+                    params={"start": start, "count": "200", "reverse": "false"},
+                )
+                if not isinstance(page, list) or not page:
+                    break
+                raw_count += len(page)
+                for raw in page:
+                    ev = self._decrypt_calendar_event(raw, cal_group_key)
+                    if ev:
+                        ok_count += 1
+                        events.append(ev)
+                if len(page) < 200:
+                    break
+                # Następna strona — start = _id ostatniego elementu
+                last_id = page[-1].get("935", "")
+                if isinstance(last_id, list):
+                    last_id = last_id[-1] if last_id else ""
+                start = last_id or "AAAAAAAAAAAA"
+
+            logger.debug("get_calendar_events: %s (field %s) → %d raw, %d odszyfrowanych",
+                         list_names[field_id], field_id, raw_count, ok_count)
+
+        logger.info("Pobrano %d eventów kalendarza", len(events))
+        return events
+
+    def _decrypt_calendar_event(
+        self, raw: dict, cal_group_key: bytes
+    ) -> Optional["CalendarEvent"]:
+        """Odszyfrowuje pojedynczy CalendarEvent. Zwraca None przy błędzie."""
+        try:
+            enc_sk_b64 = raw.get("939", "")
+            if not enc_sk_b64:
+                return None
+            session_key = aes_decrypt_tuta(
+                cal_group_key, base64.b64decode(enc_sk_b64)
+            )
+
+            def dec_str(fid: str) -> str:
+                val = raw.get(fid, "")
+                if not val:
+                    return ""
+                return aes_decrypt_tuta(
+                    session_key, base64.b64decode(val)
+                ).decode("utf-8", errors="replace")
+
+            def dec_date(fid: str) -> Optional[_datetime]:
+                val = raw.get(fid, "")
+                if not val:
+                    return None
+                # Tuta szyfruje datę jako string milli-sekund od epoki UTC
+                ms_str = aes_decrypt_tuta(
+                    session_key, base64.b64decode(val)
+                ).decode("utf-8")
+                return _datetime.utcfromtimestamp(int(ms_str) / 1000)
+
+            start = dec_date("942")
+            end   = dec_date("943")
+            uid   = dec_str("988")
+
+            # _id = [listId, elemId] — zachowaj do późniejszego usunięcia/aktualizacji
+            ev_id_raw = raw.get("935", "")
+            ev_list_id = ev_id_raw[0] if isinstance(ev_id_raw, list) and len(ev_id_raw) > 0 else ""
+            ev_elem_id = ev_id_raw[1] if isinstance(ev_id_raw, list) and len(ev_id_raw) > 1 else ""
+
+            # Fallback UID z pola _id eventu (935 = CustomId [listId, elemId])
+            if not uid:
+                uid = ev_elem_id or ""
+
+            def _is_all_day(s: Optional[_datetime], e: Optional[_datetime]) -> bool:
+                if not s or not e:
+                    return False
+                return (s.hour == 0 and s.minute == 0 and s.second == 0
+                        and e.hour == 0 and e.minute == 0 and e.second == 0)
+
+            seq_raw = raw.get("1089", "")
+            sequence = 0
+            if seq_raw:
+                try:
+                    seq_bytes = aes_decrypt_tuta(session_key, base64.b64decode(seq_raw))
+                    sequence = int(seq_bytes.decode("utf-8"))
+                except Exception:
+                    pass
+
+            rrule = self._decrypt_repeat_rule(raw.get("945"), session_key)
+
+            return CalendarEvent(
+                uid=uid,
+                summary=dec_str("940"),
+                start=start,
+                end=end,
+                location=dec_str("944"),
+                description=dec_str("941"),
+                all_day=_is_all_day(start, end),
+                sequence=sequence,
+                list_id=ev_list_id,
+                elem_id=ev_elem_id,
+                rrule=rrule,
+            )
+        except Exception as exc:
+            ev_id = raw.get("935", "?")
+            logger.warning("Błąd deszyfrowania eventu %s: %s", ev_id, exc)
+            return None
+
+    @staticmethod
+    def _decrypt_repeat_rule(raw_field, session_key: bytes) -> Optional["RepeatRule"]:
+        """
+        Deszyfruje CalendarRepeatRule z pola 945 CalendarEvent.
+        raw_field: [] gdy brak, [{...}] gdy present (ZeroOrOne aggregation).
+        """
+        if not raw_field or not isinstance(raw_field, list) or len(raw_field) == 0:
+            return None
+        rr = raw_field[0] if isinstance(raw_field[0], dict) else None
+        if not rr:
+            return None
+
+        def d(fid: str, default: str = "") -> str:
+            val = rr.get(fid, "")
+            if not val:
+                return default
+            try:
+                return aes_decrypt_tuta(session_key, base64.b64decode(val)).decode("utf-8")
+            except Exception:
+                return default
+
+        frequency = d("928", "0")
+        end_type  = d("929", "0")
+        end_value = d("930") or None
+        interval  = d("931", "1")
+        time_zone = d("932", "UTC")
+
+        # excludedDates: lista DateWrapper [{2074:_id, 2075:date_enc}]
+        excluded_dates: list[int] = []
+        for dw in (rr.get("1319") or []):
+            if not isinstance(dw, dict):
+                continue
+            date_enc = dw.get("2075", "")
+            if date_enc:
+                try:
+                    ms = int(aes_decrypt_tuta(session_key, base64.b64decode(date_enc)).decode())
+                    excluded_dates.append(ms)
+                except Exception:
+                    pass
+
+        # advancedRules: lista AdvancedRepeatRule [{1587:_id, 1588:ruleType_enc, 1589:interval_enc}]
+        advanced: list[RepeatRuleAdvanced] = []
+        for ar in (rr.get("1590") or []):
+            if not isinstance(ar, dict):
+                continue
+            rt_enc = ar.get("1588", "")
+            iv_enc = ar.get("1589", "")
+            if rt_enc and iv_enc:
+                try:
+                    rule_type = aes_decrypt_tuta(session_key, base64.b64decode(rt_enc)).decode()
+                    rule_iv   = aes_decrypt_tuta(session_key, base64.b64decode(iv_enc)).decode()
+                    advanced.append(RepeatRuleAdvanced(rule_type=rule_type, interval=rule_iv))
+                except Exception:
+                    pass
+
+        return RepeatRule(
+            frequency=frequency,
+            end_type=end_type,
+            end_value=end_value,
+            interval=interval,
+            time_zone=time_zone,
+            excluded_dates=excluded_dates,
+            advanced_rules=advanced,
+        )
+
+    @staticmethod
+    def _encode_repeat_rule(rr: "RepeatRule", session_key: bytes) -> list:
+        """
+        Koduje RepeatRule do formatu JSON dla pola 945 CalendarEvent.
+        Zwraca [{}] (One element array) jak wymaga ZeroOrOne aggregation.
+        """
+        def e(text: str) -> str:
+            return base64.b64encode(
+                aes_encrypt_tuta(session_key, text.encode("utf-8"), add_padding=True)
+            ).decode()
+
+        # excludedDates: lista DateWrapper
+        excluded = []
+        for ms in (rr.excluded_dates or []):
+            excl_id = base64.urlsafe_b64encode(os.urandom(4)).rstrip(b"=").decode()
+            excluded.append({
+                "2074": excl_id,
+                "2075": e(str(ms)),
+            })
+
+        # advancedRules: lista AdvancedRepeatRule
+        adv_rules = []
+        for ar in (rr.advanced_rules or []):
+            ar_id = base64.urlsafe_b64encode(os.urandom(4)).rstrip(b"=").decode()
+            adv_rules.append({
+                "1587": ar_id,
+                "1588": e(ar.rule_type),
+                "1589": e(ar.interval),
+            })
+
+        rr_id = base64.urlsafe_b64encode(os.urandom(4)).rstrip(b"=").decode()
+        obj = {
+            "927": rr_id,
+            "928": e(rr.frequency),
+            "929": e(rr.end_type),
+            "930": e(rr.end_value) if rr.end_value else None,
+            "931": e(rr.interval),
+            "932": e(rr.time_zone or "UTC"),
+            "1319": excluded,
+            "1590": adv_rules,
+        }
+        return [obj]
+
+    async def get_calendar_group_root_info(
+        self, session: Session
+    ) -> tuple[str, bytes, str, str, str]:
+        """Zwraca (group_id, group_key, short_list_id, long_list_id, key_version)."""
+        group_id, group_key, key_version = await self.get_calendar_group_key(session)
+        root = await self._get_tutanota(
+            self._url("tutanota", "calendargrouproot", group_id),
+            token=session.access_token,
+        )
+        def _list_id(fid: str) -> str:
+            v = root.get(fid, "")
+            return (v[-1] if isinstance(v, list) and v else v) or ""
+        return group_id, group_key, _list_id("954"), _list_id("955"), key_version
+
+    async def create_calendar_event_api(
+        self,
+        session: Session,
+        group_key: bytes,
+        group_id: str,
+        short_list_id: str,
+        long_list_id: str,
+        ev: "CalendarEvent",
+        key_version: str = "0",
+    ) -> tuple[str, str]:
+        """
+        Tworzy nowy event kalendarza w Tuta.
+        Zwraca (listId, elemId) nowego eventu.
+
+        Event trafia do shortEvents gdy czas trwania < 15 dni, inaczej do longEvents.
+        Klucz sesji eventu jest szyfrowany group_key.
+        """
+        from datetime import timezone as _tz
+
+        sk = os.urandom(32)
+        owner_enc_sk = aes_encrypt_tuta(group_key, sk, add_padding=False)
+
+        def enc(text: str) -> str:
+            return base64.b64encode(
+                aes_encrypt_tuta(sk, text.encode("utf-8"), add_padding=True)
+            ).decode()
+
+        def _to_ms(dt: Optional[_datetime]) -> int:
+            if dt is None:
+                return 0
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=_tz.utc)
+            return int(dt.timestamp() * 1000)
+
+        start_ms = _to_ms(ev.start)
+        end_ms   = _to_ms(ev.end)
+        DAYS_15_MS = 15 * 24 * 60 * 60 * 1000
+        # Tuta: isLongEvent = repeatRule != null || duration >= DAYS_SHIFTED_MS (~15 dni)
+        # Recurring events MUST be in longEvents — shortEvents są przeszukiwane range-based po ID
+        is_long  = (end_ms - start_ms) >= DAYS_15_MS or ev.rrule is not None
+        list_id  = long_list_id if is_long else short_list_id
+
+        # CustomId = base64url(str(start_ms + random_shift_±15 dni))
+        elem_id  = _generate_event_elem_id(start_ms)
+
+        uid = ev.uid or _random_custom_id()
+        hashed_uid = base64.b64encode(hashlib.sha256(uid.encode()).digest()).decode()
+
+        body = {
+            "935": [list_id, elem_id],         # _id (CustomId)
+            "936": None,                       # _permissions — null przy tworzeniu, serwer generuje
+            "937": "0",                        # _format
+            "938": group_id,                   # _ownerGroup (ZeroOrOne, FINAL)
+            "939": base64.b64encode(owner_enc_sk).decode(),  # _ownerEncSessionKey
+            "940": enc(ev.summary or ""),      # summary (Exactly1, encrypted)
+            "941": enc(ev.description or ""),  # description (Exactly1, encrypted)
+            "942": enc(str(start_ms)),         # startTime (Exactly1, encrypted)
+            "943": enc(str(end_ms)),           # endTime (Exactly1, encrypted)
+            "944": enc(ev.location or ""),     # location (Exactly1, encrypted)
+            "945": self._encode_repeat_rule(ev.rrule, sk) if ev.rrule else [],  # repeatRule (ZeroOrOne)
+            "946": [],                         # alarmInfos (LIST_ELEMENT_ASSOCIATION)
+            "988": enc(uid),                   # uid (ZeroOrOne, encrypted)
+            "1088": hashed_uid,                # hashedUid (ZeroOrOne, SHA-256 base64)
+            "1089": enc(str(ev.sequence or 0)), # sequence (Exactly1, encrypted)
+            "1090": enc("0"),                  # invitedConfidentially = false (jak Tuta web app)
+            "1091": [],                        # attendees (aggregation, Any)
+            "1092": [],                        # organizer (ZeroOrOne aggregation → [] gdy brak)
+            "1320": None,                      # recurrenceId (ZeroOrOne)
+            "1401": key_version,               # _ownerKeyVersion (widoczne w raw events)
+            "1812": None,                      # sender (ZeroOrOne)
+            "1813": enc("0"),                  # pendingInvitation (ZeroOrOne, encrypted bool)
+            "1845": None,                      # _kdfNonce (widoczne w raw events)
+        }
+        url = self._url("tutanota", "calendarevent", list_id)
+        # Tuta używa setupMultiple() nawet dla pojedynczych eventów → array + ?count=N
+        headers = {"accessToken": session.access_token, **TUTANOTA_HEADERS}
+        async with self._http.post(url, json=[body], headers=headers,
+                                   params={"count": "1"}) as r:
+            if r.status not in (200, 201):
+                text = await r.text()
+                logger.error("create_calendar_event_api: HTTP %d headers=%s — %s", r.status, dict(r.headers), text[:500])
+                raise TutaAPIError(r.status, text)
+        logger.info("create_calendar_event_api: %s → [%s, %s]", uid[:16], list_id[:12], elem_id[:12])
+        return list_id, elem_id
+
+    async def delete_calendar_event_api(
+        self,
+        session: Session,
+        list_id: str,
+        elem_id: str,
+    ) -> None:
+        """Usuwa event kalendarza przez REST DELETE."""
+        url = self._url("tutanota", "calendarevent", list_id, elem_id)
+        headers = {"accessToken": session.access_token, **TUTANOTA_HEADERS}
+        async with self._http.delete(url, headers=headers) as r:
+            if r.status not in (200, 204):
+                text = await r.text()
+                raise TutaAPIError(r.status, text)
+        logger.info("delete_calendar_event_api: [%s, %s]", list_id[:12], elem_id[:12])
+
+
 def _random_custom_id() -> str:
     """Generuje losowy CustomId (base64url, 4 bajty = 6 znaków) — format jak w importerze Tuty."""
     return base64.urlsafe_b64encode(os.urandom(4)).rstrip(b"=").decode()
+
+
+def _generate_event_elem_id(start_ms: int) -> str:
+    """
+    Generuje CustomId dla CalendarEvent na podstawie czasu startu.
+    Odpowiednik generateEventElementId() z Tuty: base64url(str(start_ms + shift).encode())
+    gdzie shift ∈ [-15 dni, +15 dni] — zapobiega ujawnieniu dokładnego czasu serwerowi.
+    """
+    import random as _rnd
+    DAYS_SHIFTED_MS = 15 * 24 * 60 * 60 * 1000
+    shift = _rnd.randint(-DAYS_SHIFTED_MS, DAYS_SHIFTED_MS)
+    return base64.urlsafe_b64encode(str(start_ms + shift).encode()).rstrip(b"=").decode()
+
+
+# ---------------------------------------------------------------------------
+# Kalendarz
+# ---------------------------------------------------------------------------
+
+from datetime import datetime as _datetime
+
+
+@dataclass
+class RepeatRuleAdvanced:
+    # ByRule enum: "2"=BYDAY, "3"=BYMONTHDAY, "4"=BYYEARDAY, "5"=BYWEEKNO, "6"=BYMONTH, "7"=BYSETPOS, "8"=WKST
+    rule_type: str
+    interval: str  # np. "MO", "1", "-1FR"
+
+
+@dataclass
+class RepeatRule:
+    # RepeatPeriod: "0"=DAILY, "1"=WEEKLY, "2"=MONTHLY, "3"=ANNUALLY
+    frequency: str
+    # EndType: "0"=Never, "1"=Count, "2"=UntilDate
+    end_type: str
+    # Dla Count: liczba powtórzeń jako string; dla UntilDate: ms timestamp ekskluzywny (start następnego dnia)
+    end_value: Optional[str]
+    interval: str           # "1" = co 1 okres
+    time_zone: str          # np. "Europe/Warsaw"
+    excluded_dates: list    # ms timestamps (z EXDATE)
+    advanced_rules: list    # lista RepeatRuleAdvanced
+
+
+@dataclass
+class CalendarEvent:
+    uid: str
+    summary: str
+    start: Optional[_datetime]
+    end: Optional[_datetime]
+    location: str
+    description: str
+    all_day: bool
+    sequence: int = 0
+    list_id: str = ""   # _id[0] — shortEvents lub longEvents list ID
+    elem_id: str = ""   # _id[1] — CustomId elementu w liście
+    rrule: Optional["RepeatRule"] = None
 
 
 # ---------------------------------------------------------------------------

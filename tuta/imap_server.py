@@ -221,6 +221,10 @@ class IMAPConnection:
         # Maile z null _ownerEncSessionKey podczas IDLE — element_id → (list_id, element_id).
         # Retry przy NOOP gdy serwer Tuty skończy asynchroniczne szyfrowanie.
         self._pending_mail_ids: dict[str, tuple[str, str]] = {}
+        # Persystentny bufor eventów — wypełniany przez _bg_event_watcher niezależnie od IDLE.
+        # Dzięki temu eventy nie są tracone w przerwach między sesjami IDLE.
+        self._event_queue: asyncio.Queue = asyncio.Queue()
+        self._event_watcher_task: Optional[asyncio.Task] = None
 
         peer = writer.get_extra_info("peername")
         self.peer = f"{peer[0]}:{peer[1]}" if peer else "unknown"
@@ -283,6 +287,7 @@ class IMAPConnection:
         except Exception as e:
             logger.exception(f"[{self.peer}] Nieoczekiwany błąd: {e}")
         finally:
+            self._stop_event_watcher()
             try:
                 self.writer.close()
             except Exception:
@@ -371,26 +376,45 @@ class IMAPConnection:
         self._ok(tag, "CAPABILITY completed")
 
     async def _cmd_noop(self, tag: str, args: str) -> None:
+        if self.state == "SELECTED" and self.mailbox and self.session:
+            # Przetwórz eventy które przyszły poza IDLE (podczas przerwy między sesjami)
+            while not self._event_queue.empty():
+                try:
+                    event = self._event_queue.get_nowait()
+                    await self._process_ws_event(event)
+                except asyncio.QueueEmpty:
+                    break
         if self.state == "SELECTED" and self.mailbox and self._pending_mail_ids and self.session:
             resolved = []
+            inserted_any = False
             for elem_id, (list_id, _) in list(self._pending_mail_ids.items()):
                 try:
                     mail_raw = await self.client.get_single_mail(self.session, list_id, elem_id)
                     if mail_raw and self._is_mail_decryptable(mail_raw):
                         if self._insert_mail_raw(mail_raw):
-                            logger.info(f"[{self.peer}] NOOP: mail {elem_id} gotowy po retry, wstrzyknięto")
-                        resolved.append(elem_id)
+                            logger.info(f"[{self.peer}] NOOP: mail {elem_id} wstrzyknięto")
+                            resolved.append(elem_id)
+                            inserted_any = True
+                        else:
+                            # Dekrypowalny ale nadal nie pasuje do folderu — porzuć po tej próbie
+                            # (prawdopodobnie mail z innego folderu lub trwały problem z 1465)
+                            logger.warning(
+                                "[%s] NOOP: mail %s dekrypowalny ale insert nieudany — usuwam z pending",
+                                self.peer, elem_id,
+                            )
+                            resolved.append(elem_id)
                 except Exception as e:
                     logger.debug(f"[{self.peer}] NOOP pending retry {elem_id}: {e}")
             for eid in resolved:
                 del self._pending_mail_ids[eid]
-            if resolved:
+            if inserted_any:
                 self._untagged(f"{self.mailbox.exists} EXISTS")
                 self._untagged("0 RECENT")
                 await self.writer.drain()
         self._ok(tag, "NOOP completed")
 
     async def _cmd_logout(self, tag: str, args: str) -> None:
+        self._stop_event_watcher()
         self._untagged("BYE tuta-proxy logging out")
         self._ok(tag, "LOGOUT completed")
         self.state = "LOGOUT"
@@ -627,6 +651,8 @@ class IMAPConnection:
         )
         self._msg_cache.clear()
         self.state = "SELECTED"
+        # Uruchom persystentny watcher (lub zostaw działający jeśli już działa)
+        self._start_event_watcher()
 
         # UIDNEXT musi być > wszystkich istniejących UID (RFC 3501 §2.3.1.1)
         if self.mailbox.messages:
@@ -882,7 +908,13 @@ class IMAPConnection:
         if field_1310 and sess and sess.priv_ecc and sess.kyber_sk:
             try:
                 entry = field_1310[0] if isinstance(field_1310, list) else field_1310
-                pq_msg = _b64.b64decode(entry.get("2045", ""))
+                pq_msg_b64 = entry.get("2045") or ""
+                if not pq_msg_b64:
+                    # Tuta jeszcze przetwarza mail — pole 2045 jest null; czekaj na UPDATE
+                    logger.debug("PQ: pole 2045 puste dla %s — Tuta w trakcie przetwarzania",
+                                 mail_raw.get("99", "?"))
+                    raise ValueError("pole 2045 puste")
+                pq_msg = _b64.b64decode(pq_msg_b64)
                 bucket_key = pq_decapsulate_bucket_key(
                     sess.priv_ecc, sess.pub_ecc, sess.pub_kyber_tuta, sess.kyber_sk, pq_msg
                 )
@@ -1727,6 +1759,50 @@ class IMAPConnection:
         self._ok(tag, "COPY completed")
 
     # -----------------------------------------------------------------------
+    # Persystentny watcher WebSocket — buforuje eventy niezależnie od IDLE
+    # -----------------------------------------------------------------------
+
+    def _start_event_watcher(self) -> None:
+        """Uruchamia background task który trzyma WebSocket alive przez całą sesję."""
+        if self._event_watcher_task is None or self._event_watcher_task.done():
+            self._event_watcher_task = asyncio.create_task(self._bg_event_watcher())
+
+    def _stop_event_watcher(self) -> None:
+        if self._event_watcher_task and not self._event_watcher_task.done():
+            self._event_watcher_task.cancel()
+
+    async def _bg_event_watcher(self) -> None:
+        """Łączy się z WebSocket Tuty i buforuje eventy w _event_queue.
+        Automatycznie reconnectuje po zamknięciu połączenia — nigdy nie przerywa
+        między sesjami IDLE, więc żaden CREATE event nie jest tracony."""
+        while self.session and self.state not in ("LOGOUT", "NOT_AUTH"):
+            try:
+                async for event in self.client.iter_event_stream(self.session):
+                    await self._event_queue.put(event)
+                logger.debug("[%s] event watcher: WS zamknięty, reconnect za 2s", self.peer)
+                await asyncio.sleep(2)
+            except asyncio.CancelledError:
+                return
+            except Exception as e:
+                logger.warning("[%s] event watcher error: %s, reconnect za 5s", self.peer, e)
+                await asyncio.sleep(5)
+        logger.debug("[%s] event watcher: sesja zakończona", self.peer)
+
+    async def _process_ws_event(self, event: dict) -> None:
+        """Przetwarza pojedynczy event z WebSocket (używane przez IDLE i NOOP)."""
+        if not self.mailbox:
+            return
+        if event["application"] != "tutanota" or event["type_id"] != "97":
+            return
+        op = event["operation"]
+        list_id = event["list_id"]
+        element_id = event["element_id"]
+        if op == "0":
+            await self._idle_handle_new_mail(list_id, element_id)
+        elif op == "1":
+            await self._idle_handle_mail_update(list_id, element_id)
+
+    # -----------------------------------------------------------------------
     # IDLE — push nowych wiadomości przez WebSocket (RFC 2177)
     # -----------------------------------------------------------------------
 
@@ -1737,6 +1813,9 @@ class IMAPConnection:
         self._send("+ idling")
         await self.writer.drain()
 
+        # Uruchom persystentny watcher jeśli jeszcze nie działa
+        self._start_event_watcher()
+
         async def _wait_done():
             # Czekaj na "DONE" od klienta; ignoruj inne linie podczas IDLE
             while True:
@@ -1746,13 +1825,20 @@ class IMAPConnection:
                 if line.decode("utf-8", errors="replace").rstrip("\r\n").strip().upper() == "DONE":
                     return
 
+        async def _drain_queue():
+            # Czyta eventy z kolejki i przetwarza — kolejka jest wypełniana przez _bg_event_watcher
+            while True:
+                event = await self._event_queue.get()
+                await self._process_ws_event(event)
+
         done_task = asyncio.create_task(_wait_done())
-        watch_task = asyncio.create_task(self._idle_watch_events())
+        drain_task = asyncio.create_task(_drain_queue())
 
         try:
-            await asyncio.wait([done_task, watch_task], return_when=asyncio.FIRST_COMPLETED)
+            await asyncio.wait([done_task, drain_task], return_when=asyncio.FIRST_COMPLETED)
         finally:
-            for t in (done_task, watch_task):
+            # Zatrzymaj tylko drain — background watcher działa dalej przez całą sesję
+            for t in (done_task, drain_task):
                 if not t.done():
                     t.cancel()
                     try:
@@ -1762,30 +1848,28 @@ class IMAPConnection:
 
         self._ok(tag, "IDLE terminated")
 
-    async def _idle_watch_events(self) -> None:
-        """Obserwuje WebSocket Tuty podczas IDLE, wysyła IMAP notifications."""
-        try:
-            async for event in self.client.iter_event_stream(self.session):
-                if event["application"] != "tutanota" or event["type_id"] != "97":
-                    continue
-                op = event["operation"]
-                list_id = event["list_id"]
-                element_id = event["element_id"]
-                if op == "0":   # CREATE — nowa wiadomość
-                    await self._idle_handle_new_mail(list_id, element_id)
-                elif op == "1": # UPDATE — zmiana flag (np. przeczytana w innym kliencie)
-                    await self._idle_handle_mail_update(list_id, element_id)
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            logger.warning(f"[{self.peer}] IDLE watcher: {e}")
-
     @staticmethod
     def _is_mail_decryptable(mail_raw: dict) -> bool:
         """Zwraca True jeśli mail ma klucz sesji (pole 102) lub TutaCrypt PQ (pole 1310)."""
         if mail_raw.get("102"):
             return True
         return bool(mail_raw.get("1310"))
+
+    @staticmethod
+    def _is_mail_decryption_ready(mail_raw: dict) -> bool:
+        """True jeśli mail jest gotowy do dekrypcji — nie tylko że pola istnieją.
+        Tuta przetwarza E2E maile asynchronicznie: pole 1310 pojawia się przed polem 102
+        i przed wypełnieniem pola 2045 (pubEncBucketKey). Czekamy aż jedno z dwóch jest
+        faktycznie gotowe żeby uniknąć błędu przy FETCH."""
+        if mail_raw.get("102"):
+            return True
+        # PQ gotowe gdy pole 2045 jest wypełnione (nie null)
+        field_1310 = mail_raw.get("1310") or []
+        if field_1310:
+            entry = field_1310[0] if isinstance(field_1310, list) else field_1310
+            if isinstance(entry, dict) and entry.get("2045"):
+                return True
+        return False
 
     def _insert_mail_raw(self, mail_raw: dict) -> bool:
         """
@@ -1802,6 +1886,11 @@ class IMAPConnection:
             for ref in folder_refs
         )
         if not in_folder:
+            mid = mail_raw.get("99", "?")
+            logger.debug(
+                "[insert] mail %s odrzucony: folder.id=%s, 1465=%r",
+                mid, self.mailbox.folder.id, folder_refs,
+            )
             return False
         uid = tuta_id_to_uid(mail_raw.get("99", ""))
         # Pomiń jeśli już w skrzynce (np. podwójny event)
@@ -1816,25 +1905,38 @@ class IMAPConnection:
         return True
 
     async def _idle_handle_new_mail(self, list_id: str, element_id: str) -> None:
-        # Tuta może jeszcze przetwarzać mail w chwili wysłania WebSocket eventu.
-        # Retry z wykładniczym backoff — czekamy aż mail będzie dekrypowalny
-        # (pole 102 non-null LUB pole 1310 z PQ message obecne).
+        # Tuta przetwarza mail asynchronicznie po wysłaniu WebSocket eventu.
+        # Czekamy aż mail będzie dekrypowalny (pole 102 lub 1310) ORAZ
+        # pole 1465 (mailSet) będzie wypełnione (potrzebne do przypisania do folderu).
         mail_raw = None
-        for attempt in range(4):
+        for attempt in range(5):
             if attempt > 0:
-                await asyncio.sleep(2 ** (attempt - 1))  # 1, 2, 4 s
+                await asyncio.sleep(2 ** (attempt - 1))  # 1, 2, 4, 8 s
             try:
                 mail_raw = await self.client.get_single_mail(self.session, list_id, element_id)
-                if self._is_mail_decryptable(mail_raw):
+                dec = self._is_mail_decryptable(mail_raw)
+                has_folder = bool(mail_raw.get("1465"))
+                dec_ready = self._is_mail_decryption_ready(mail_raw)
+                if dec and has_folder and dec_ready:
                     break
-                logger.debug(f"[{self.peer}] IDLE: mail {element_id} niedekrypowalny, attempt {attempt + 1}")
+                logger.debug(
+                    "[%s] IDLE: mail %s attempt %d: dec=%s, 1465=%r, dec_ready=%s",
+                    self.peer, element_id, attempt + 1, dec, mail_raw.get("1465"), dec_ready,
+                )
             except Exception as e:
                 logger.warning(f"[{self.peer}] IDLE new mail fetch {element_id} attempt {attempt + 1}: {e}")
                 mail_raw = None
         if not mail_raw or not self._is_mail_decryptable(mail_raw):
             logger.warning(
-                f"[{self.peer}] IDLE: mail {element_id} niedekrypowalny po retries — "
-                f"odkładam do pending (retry przy NOOP)"
+                "[%s] IDLE: mail %s niedekrypowalny po retries — pending",
+                self.peer, element_id,
+            )
+            self._pending_mail_ids[element_id] = (list_id, element_id)
+            return
+        if not mail_raw.get("1465") or not self._is_mail_decryption_ready(mail_raw):
+            logger.warning(
+                "[%s] IDLE: mail %s brak 1465=%r lub dec_ready=False po retries — pending",
+                self.peer, element_id, mail_raw.get("1465"),
             )
             self._pending_mail_ids[element_id] = (list_id, element_id)
             return
@@ -1846,6 +1948,18 @@ class IMAPConnection:
             await self.writer.drain()
             uid = tuta_id_to_uid(mail_raw.get("99", ""))
             logger.info(f"[{self.peer}] IDLE: new mail uid={uid}, folder={self.mailbox.folder.id}, EXISTS={count}")
+        else:
+            # Mail dekrypowalny ale nie pasuje do aktualnego folderu — może timing lub
+            # brak pola 1465 w single-mail response; odkładamy do pending żeby NOOP mógł retry.
+            folder_refs = mail_raw.get("1465", [])
+            logger.warning(
+                "[%s] IDLE: mail %s dekrypowalny ale nie wstawiony "
+                "(folder.id=%s, 1465=%r) — pending retry",
+                self.peer, element_id,
+                self.mailbox.folder.id if self.mailbox else "?",
+                folder_refs,
+            )
+            self._pending_mail_ids[element_id] = (list_id, element_id)
 
     async def _idle_handle_mail_update(self, list_id: str, element_id: str) -> None:
         # Znajdź mail w bieżącej skrzynce (jeśli tam jest)
