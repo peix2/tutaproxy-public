@@ -21,7 +21,7 @@ Tuta is a privacy-focused email service with strong end-to-end encryption. It on
 - **Attachments** — download and upload, including inline images
 - **Import from other accounts** — copy or move messages from Gmail or any other IMAP account into Tuta (with attachments); messages land in Inbox as properly encrypted Tuta mail
 - **Folder management** — create, rename, delete folders; move messages between folders (IMAP COPY)
-- **CalDAV (calendar sync)** — read-only CalDAV server exposes your Tuta calendars to any CalDAV client (Thunderbird, Apple Calendar, etc.); events include recurrence rules (RRULE)
+- **CalDAV (calendar sync)** — CalDAV server exposes your Tuta calendars to any CalDAV client (Thunderbird, Apple Calendar, etc.); supports reading, creating, updating, and deleting events; recurrence rules (RRULE) fully supported
 - **Push updates** — IMAP IDLE support so your client gets notified of new mail without polling
 - **Flags** — read/unread, deleted (with EXPUNGE)
 - **SQLite cache** — folder list and message IDs are cached locally to speed up reconnects
@@ -138,7 +138,6 @@ Use your full Tuta email address as the username and your Tuta password.
 2. Account type: **Manual**, server: `http://localhost:5232/`.
 3. Username: your Tuta email, password: your Tuta password.
 
-> **Note:** CalDAV is currently read-only. Creating or editing events from the calendar client is not supported — changes must be made in the Tuta app.
 
 ---
 

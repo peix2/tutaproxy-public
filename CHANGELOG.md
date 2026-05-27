@@ -10,10 +10,10 @@ Versioning: [Semantic Versioning](https://semver.org/) — MAJOR.MINOR.PATCH.
 ## [1.1.0] — 2026-05-27
 
 ### Added
-- **CalDAV server** — read-only CalDAV server on port `5232` exposes all Tuta calendars
-  to standard calendar clients (Thunderbird via TbSync, Apple Calendar, etc.).
-  Events include full recurrence support (RRULE), timezone handling, and all standard
-  iCalendar fields. Use your Tuta credentials to authenticate.
+- **CalDAV server** — CalDAV server on port `5232` exposes all Tuta calendars to standard
+  calendar clients (Thunderbird via TbSync, Apple Calendar, etc.). Supports read, create,
+  update, and delete. Events include full recurrence support (RRULE), timezone handling,
+  and all standard iCalendar fields. Use your Tuta credentials to authenticate.
 
 ### Fixed
 - **Secure External replies now appear in Thunderbird automatically** — previously a reply
