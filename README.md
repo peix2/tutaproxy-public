@@ -119,7 +119,7 @@ python run_carddav.py
 
 ## CalDAV Setup (calendar sync)
 
-The proxy exposes a read-only CalDAV server on port `5232`. Point your calendar client to:
+The proxy exposes a CalDAV server on port `5232`. Point your calendar client to:
 
 ```
 http://localhost:5232/
