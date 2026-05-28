@@ -7,6 +7,43 @@ Versioning: [Semantic Versioning](https://semver.org/) — MAJOR.MINOR.PATCH.
 
 ---
 
+## [1.2.3] — 2026-05-28
+
+### Fixed
+- **Modified recurring event occurrences now appear correctly in Thunderbird** — when a
+  single occurrence of a recurring event is modified in Tuta (e.g. moved from 2 PM to 3 PM),
+  it now shows up as expected in CalDAV clients instead of disappearing.
+
+  Root cause 1 — EXDATE/RECURRENCE-ID conflict: Tuta internally stores both an `EXDATE` on
+  the master event (marking the original occurrence as removed) and a separate override event
+  with `recurrenceId` set. RFC 5545 §3.8.5.1 gives `EXDATE` precedence over `RECURRENCE-ID`,
+  so Thunderbird deleted the occurrence and ignored the override. Fixed by omitting `EXDATE`
+  entries that have a corresponding `RECURRENCE-ID` override.
+
+  Root cause 2 — timezone mismatch in timestamp comparison: `datetime.utcfromtimestamp()`
+  returns a naïve datetime that `datetime.timestamp()` then interprets as local time (e.g.
+  UTC+12), producing a 12-hour offset that prevented the EXDATE filter from matching.
+  Fixed by attaching UTC tzinfo before calling `timestamp()`.
+
+- **`RECURRENCE-ID` uses the master event's timezone** — the override event inherits the
+  master's `TZID` (e.g. `Pacific/Auckland`) so that `RECURRENCE-ID;TZID=Pacific/Auckland:`
+  matches the original occurrence's `DTSTART` format, as required by RFC 5545 §3.8.4.4.
+
+---
+
+## [1.2.2] — 2026-05-28
+
+### Fixed
+- **VTIMEZONE block included in CalDAV iCal export** — recurring events with a non-UTC
+  timezone (e.g. `Europe/Warsaw`) were exported with `DTSTART;TZID=...` but without the
+  required `VTIMEZONE` component in the same `VCALENDAR`. RFC 5545 requires a `VTIMEZONE`
+  block whenever a `TZID` is referenced. Fixed by generating `VTIMEZONE` blocks dynamically
+  from the IANA timezone database (`zoneinfo`, stdlib) — one block per unique timezone used
+  across all events, inserted between the `VCALENDAR` header and the `VEVENT` blocks.
+  No new dependencies.
+
+---
+
 ## [1.2.1] — 2026-05-27
 
 ### Fixed

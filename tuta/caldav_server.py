@@ -163,13 +163,17 @@ def _cs(tag: str) -> str:
 
 def _events_ctag(events: list) -> str:
     """Hash zbioru eventów — zmienia się przy dodaniu / usunięciu / edycji."""
-    parts = sorted(f"{ev.uid}:{ev.elem_id}:{ev.sequence}" for ev in events)
+    parts = sorted(
+        f"{ev.uid}:{ev.elem_id}:{ev.sequence}:{ev.recurrence_id}:{ev.start}:{ev.end}"
+        for ev in events
+    )
     return hashlib.sha256("\n".join(parts).encode()).hexdigest()[:32]
 
 
 def _event_etag(ev) -> str:
     """Unikalny tag treści eventu — zmienia się gdy zmienia się summary/czas/seq."""
-    content = f"{ev.uid}:{ev.summary}:{ev.start}:{ev.end}:{ev.sequence}:{ev.location}"
+    content = (f"{ev.uid}:{ev.summary}:{ev.start}:{ev.end}"
+               f":{ev.sequence}:{ev.location}:{ev.recurrence_id}")
     return '"' + hashlib.sha256(content.encode()).hexdigest()[:16] + '"'
 
 
@@ -346,7 +350,85 @@ def _rrule_to_ical(rr: RepeatRule, all_day: bool) -> str:
     return "RRULE:" + ";".join(parts)
 
 
-def _event_to_vevent(ev: CalendarEvent) -> str:
+def _vtimezone_block(tz_str: str) -> str:
+    """
+    Generuje blok VTIMEZONE (RFC 5545 §3.6.5) dla strefy IANA tz_str.
+
+    Skanuje bieżący rok godzinowo, wykrywa przejścia DST i emituje komponenty
+    STANDARD/DAYLIGHT z konkretnymi DTSTART (bez RRULE — uproszczone, ale
+    akceptowane przez wszystkich klientów). Dla stref bez DST emituje jeden
+    komponent STANDARD z DTSTART:19700101T000000.
+    """
+    try:
+        from zoneinfo import ZoneInfo
+        tz = ZoneInfo(tz_str)
+    except Exception:
+        return ""
+
+    from datetime import datetime, timedelta, timezone as _fixed
+
+    year = datetime.now().year
+    epoch = datetime(year, 1, 1, 0, 0, tzinfo=_fixed.utc)
+
+    def _off(dt_utc: datetime):
+        return dt_utc.astimezone(tz).utcoffset()
+
+    def _fmt_off(td) -> str:
+        secs = int(td.total_seconds())
+        sign = "+" if secs >= 0 else "-"
+        secs = abs(secs)
+        h, rem = divmod(secs, 3600)
+        return f"{sign}{h:02d}{rem // 60:02d}"
+
+    prev_off = _off(epoch)
+    transitions = []
+
+    for h in range(1, 8761):          # 365 × 24 + 1
+        dt = epoch + timedelta(hours=h)
+        off = _off(dt)
+        if off == prev_off:
+            continue
+        # Zawęź do minuty
+        base = epoch + timedelta(hours=h - 1)
+        trans_utc = dt                 # fallback
+        for m in range(60):
+            t = base + timedelta(minutes=m + 1)
+            if _off(t) != prev_off:
+                trans_utc = t
+                break
+        # DTSTART = czas lokalny (w poprzedniej strefie) w momencie przejścia
+        dtstart = trans_utc.astimezone(_fixed(prev_off)).strftime("%Y%m%dT%H%M%S")
+        transitions.append({"from": prev_off, "to": off, "dtstart": dtstart})
+        prev_off = off
+
+    parts = ["BEGIN:VTIMEZONE\r\n", f"TZID:{tz_str}\r\n"]
+
+    if not transitions:
+        off_s = _fmt_off(prev_off)
+        parts += [
+            "BEGIN:STANDARD\r\n",
+            "DTSTART:19700101T000000\r\n",
+            f"TZOFFSETFROM:{off_s}\r\n",
+            f"TZOFFSETTO:{off_s}\r\n",
+            "END:STANDARD\r\n",
+        ]
+    else:
+        for tr in transitions:
+            ctype = "DAYLIGHT" if tr["to"] > tr["from"] else "STANDARD"
+            parts += [
+                f"BEGIN:{ctype}\r\n",
+                f"DTSTART:{tr['dtstart']}\r\n",
+                f"TZOFFSETFROM:{_fmt_off(tr['from'])}\r\n",
+                f"TZOFFSETTO:{_fmt_off(tr['to'])}\r\n",
+                f"END:{ctype}\r\n",
+            ]
+
+    parts.append("END:VTIMEZONE\r\n")
+    return "".join(parts)
+
+
+def _event_to_vevent(ev: CalendarEvent, master_tz: Optional[str] = None,
+                     override_ms: Optional[set] = None) -> str:
     lines = ["BEGIN:VEVENT\r\n"]
 
     def add(prop: str, val: str) -> None:
@@ -356,11 +438,24 @@ def _event_to_vevent(ev: CalendarEvent) -> str:
         if val:
             lines.append(_ical_fold(f"{prop}:{_ical_escape(val)}"))
 
-    # Gdy event jest cykliczny, DTSTART używa TZID zamiast UTC (Tuta web app tak robi)
+    # Strefa czasowa: dla eventów cyklicznych z pola RRULE; dla wyjątków cyklu
+    # (recurrence_id bez rrule) używamy strefy mastera — RFC 5545 §3.8.4.4 wymaga
+    # żeby RECURRENCE-ID miał ten sam format co DTSTART mastera (TZID lub UTC).
     rr = ev.rrule
     tz_str = (rr.time_zone if rr and rr.time_zone and rr.time_zone != "UTC" else None)
+    if not tz_str and ev.recurrence_id and master_tz and master_tz != "UTC":
+        tz_str = master_tz
 
     add("UID", ev.uid)
+    # RECURRENCE-ID — obecne tylko dla wyjątków cyklu (modyfikacja jednego powtórzenia)
+    if ev.recurrence_id:
+        rid = ev.recurrence_id
+        if ev.all_day:
+            add("RECURRENCE-ID;VALUE=DATE", rid.strftime("%Y%m%d"))
+        elif tz_str:
+            add(f"RECURRENCE-ID;TZID={tz_str}", _fmt_dt_local(rid, tz_str))
+        else:
+            add("RECURRENCE-ID", rid.strftime("%Y%m%dT%H%M%SZ"))
     if ev.start:
         if ev.all_day:
             add("DTSTART;VALUE=DATE", _fmt_dt(ev.start, True))
@@ -382,12 +477,14 @@ def _event_to_vevent(ev: CalendarEvent) -> str:
 
     if rr:
         lines.append(_ical_fold(_rrule_to_ical(rr, ev.all_day)))
-        # EXDATE — wykluczone daty powtórzeń
+        # EXDATE — wykluczone daty powtórzeń (bez dat które mają RECURRENCE-ID override)
         if rr.excluded_dates:
             from datetime import timezone as _tz
             tz_label = rr.time_zone or "UTC"
             ex_vals = []
             for ms in sorted(rr.excluded_dates):
+                if override_ms and ms in override_ms:
+                    continue  # override event przejmuje to wystąpienie — EXDATE byłoby błędem
                 dt = datetime.utcfromtimestamp(ms / 1000).replace(tzinfo=_tz.utc)
                 if ev.all_day:
                     ex_vals.append(dt.strftime("%Y%m%d"))
@@ -395,12 +492,13 @@ def _event_to_vevent(ev: CalendarEvent) -> str:
                     ex_vals.append(_fmt_dt_local(dt, tz_str))
                 else:
                     ex_vals.append(dt.strftime("%Y%m%dT%H%M%SZ"))
-            if ev.all_day:
-                lines.append(_ical_fold(f"EXDATE;VALUE=DATE:{','.join(ex_vals)}"))
-            elif tz_str:
-                lines.append(_ical_fold(f"EXDATE;TZID={tz_label}:{','.join(ex_vals)}"))
-            else:
-                lines.append(_ical_fold(f"EXDATE:{','.join(ex_vals)}"))
+            if ex_vals:
+                if ev.all_day:
+                    lines.append(_ical_fold(f"EXDATE;VALUE=DATE:{','.join(ex_vals)}"))
+                elif tz_str:
+                    lines.append(_ical_fold(f"EXDATE;TZID={tz_label}:{','.join(ex_vals)}"))
+                else:
+                    lines.append(_ical_fold(f"EXDATE:{','.join(ex_vals)}"))
 
     lines.append("END:VEVENT\r\n")
     return "".join(lines)
@@ -581,7 +679,36 @@ def events_to_ical(events: list[CalendarEvent]) -> str:
         "CALSCALE:GREGORIAN\r\n",
         "METHOD:PUBLISH\r\n",
     ]
-    parts.extend(_event_to_vevent(ev) for ev in events)
+    # Mapa UID → strefa czasowa z masterów (eventów cyklicznych).
+    # Wyjątki cyklu (recurrence_id bez rrule) dziedziczą tę strefę,
+    # żeby RECURRENCE-ID używał tego samego formatu co DTSTART mastera (RFC 5545 §3.8.4.4).
+    uid_to_tz: dict[str, str] = {}
+    for ev in events:
+        if ev.rrule and ev.rrule.time_zone and ev.rrule.time_zone != "UTC":
+            uid_to_tz[ev.uid] = ev.rrule.time_zone
+
+    # VTIMEZONE dla każdej unikalnej strefy (master + wyjątki dziedziczące strefę mastera)
+    seen_tz: set[str] = set()
+    for ev in events:
+        tz = ev.rrule.time_zone if ev.rrule else uid_to_tz.get(ev.uid) if ev.recurrence_id else None
+        if tz and tz != "UTC" and tz not in seen_tz:
+            seen_tz.add(tz)
+            parts.append(_vtimezone_block(tz))
+
+    # Dla każdego UID zbierz timestampy (ms) override eventów — master nie powinien
+    # emitować EXDATE dla tych dat (RECURRENCE-ID override już je obsługuje).
+    # recurrence_id jest naiwnym datetime UTC (utcfromtimestamp) — replace(tzinfo=utc)
+    # zapobiega błędnej interpretacji jako czas lokalny przez timestamp().
+    from datetime import timezone as _utc_tz
+    uid_to_override_ms: dict[str, set[int]] = {}
+    for ev in events:
+        if ev.recurrence_id:
+            ms = int(ev.recurrence_id.replace(tzinfo=_utc_tz.utc).timestamp() * 1000)
+            uid_to_override_ms.setdefault(ev.uid, set()).add(ms)
+
+    for ev in events:
+        parts.append(_event_to_vevent(ev, uid_to_tz.get(ev.uid),
+                                      uid_to_override_ms.get(ev.uid)))
     parts.append("END:VCALENDAR\r\n")
     return "".join(parts)
 

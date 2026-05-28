@@ -2328,6 +2328,10 @@ class TutaClient:
                     pass
 
             rrule = self._decrypt_repeat_rule(raw.get("945"), session_key)
+            try:
+                recurrence_id = dec_date("1320")
+            except Exception:
+                recurrence_id = None
 
             return CalendarEvent(
                 uid=uid,
@@ -2341,6 +2345,7 @@ class TutaClient:
                 list_id=ev_list_id,
                 elem_id=ev_elem_id,
                 rrule=rrule,
+                recurrence_id=recurrence_id,
             )
         except Exception as exc:
             ev_id = raw.get("935", "?")
@@ -3004,6 +3009,9 @@ class CalendarEvent:
     list_id: str = ""   # _id[0] — shortEvents lub longEvents list ID
     elem_id: str = ""   # _id[1] — CustomId elementu w liście
     rrule: Optional["RepeatRule"] = None
+    # Ustawione gdy event jest wyjątkiem cyklu (modyfikacja pojedynczego powtórzenia).
+    # Zawiera czas oryginalnego powtórzenia (UTC). Eksportowane jako RECURRENCE-ID w iCal.
+    recurrence_id: Optional[_datetime] = None
 
 
 # ---------------------------------------------------------------------------
