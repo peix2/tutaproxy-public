@@ -683,9 +683,13 @@ def events_to_ical(events: list[CalendarEvent]) -> str:
     # Wyjątki cyklu (recurrence_id bez rrule) dziedziczą tę strefę,
     # żeby RECURRENCE-ID używał tego samego formatu co DTSTART mastera (RFC 5545 §3.8.4.4).
     uid_to_tz: dict[str, str] = {}
+    # UIDs które mają mastera (event cykliczny z RRULE) — potrzebne do detekcji orphan overrides
+    master_uids: set[str] = set()
     for ev in events:
-        if ev.rrule and ev.rrule.time_zone and ev.rrule.time_zone != "UTC":
-            uid_to_tz[ev.uid] = ev.rrule.time_zone
+        if ev.rrule:
+            master_uids.add(ev.uid)
+            if ev.rrule.time_zone and ev.rrule.time_zone != "UTC":
+                uid_to_tz[ev.uid] = ev.rrule.time_zone
 
     # VTIMEZONE dla każdej unikalnej strefy (master + wyjątki dziedziczące strefę mastera)
     seen_tz: set[str] = set()
@@ -707,8 +711,17 @@ def events_to_ical(events: list[CalendarEvent]) -> str:
             uid_to_override_ms.setdefault(ev.uid, set()).add(ms)
 
     for ev in events:
-        parts.append(_event_to_vevent(ev, uid_to_tz.get(ev.uid),
-                                      uid_to_override_ms.get(ev.uid)))
+        # Orphan override (recurrence_id bez mastera) → emituj bez RECURRENCE-ID,
+        # bo RFC 5545 wymaga obecności mastera; brak go powoduje błąd u klientów CalDAV.
+        master_tz = uid_to_tz.get(ev.uid)
+        if ev.recurrence_id and ev.uid not in master_uids:
+            logger.warning("CalDAV: orphan override %s (brak mastera) — emituję bez RECURRENCE-ID",
+                           ev.uid[:32])
+            ev_patched = type(ev)(**{**ev.__dict__, "recurrence_id": None})
+            parts.append(_event_to_vevent(ev_patched, master_tz, None))
+        else:
+            parts.append(_event_to_vevent(ev, master_tz,
+                                          uid_to_override_ms.get(ev.uid)))
     parts.append("END:VCALENDAR\r\n")
     return "".join(parts)
 
@@ -1108,8 +1121,15 @@ class CalDAVServer:
         if is_blob:
             evs = _parse_ical_all(ical_text)
             if not evs:
-                return _text_resp(400, "Bad Request", "Nie można sparsować iCal (brak VEVENT)")
-            logger.debug("CalDAV PUT blob: %d eventów w body", len(evs))
+                # Pusty body lub brak BEGIN:VCALENDAR → odrzuć.
+                # Pusty VCALENDAR (zero VEVENT) jest poprawny — oznacza "usuń wszystkie zdarzenia
+                # widoczne w snapshottcie" (Thunderbird robi tak przy usuwaniu ostatniego eventu).
+                if not ical_text.strip() or "BEGIN:VCALENDAR" not in ical_text.upper():
+                    logger.warning("CalDAV PUT blob: brak VCALENDAR w body — odrzucam")
+                    return _text_resp(400, "Bad Request", "Nie można sparsować iCal (brak VCALENDAR)")
+                logger.debug("CalDAV PUT blob: VCALENDAR bez VEVENT — usunięcie z snapshotu")
+            else:
+                logger.debug("CalDAV PUT blob: %d eventów w body", len(evs))
         else:
             ev = _parse_ical(ical_text)
             if ev is None:
@@ -1142,6 +1162,12 @@ class CalDAVServer:
             return _text_resp(503, "Service Unavailable", str(e))
 
         uid_map = {self._safe_uid(e.uid): e for e in events}
+        # Jeden UID może mieć wiele eventów (master + override z recurrence_id).
+        # uid_map trzyma tylko jeden (dict), uid_to_all trzyma wszystkie — potrzebne
+        # przy usuwaniu całego cyklu: usuwamy i master i wszystkie overrides.
+        uid_to_all: dict[str, list] = {}
+        for e in events:
+            uid_to_all.setdefault(self._safe_uid(e.uid), []).append(e)
 
         if is_blob:
             # Blob mode: pełna synchronizacja z Thunderbirda do Tuty.
@@ -1200,24 +1226,28 @@ class CalDAVServer:
                                      (ev_item.uid or "")[:16], e)
                         errors.append(str(e))
 
-            # DELETE — eventy znane z GET / ale nieobecne w PUT → usunięte w Thunderbirdzie
+            # DELETE — eventy znane z GET / ale nieobecne w PUT → usunięte w Thunderbirdzie.
+            # Dla każdego UID usuwamy WSZYSTKIE powiązane eventy (master + override z tym UID),
+            # bo dict uid_map trzyma tylko jeden — orphan override pozostałby po usunięciu mastera.
             for uid in known_uids - put_uids:
-                existing = uid_map.get(self._safe_uid(uid))
-                if not existing or not existing.list_id or not existing.elem_id:
-                    continue
-                try:
-                    await client.delete_calendar_event_api(
-                        session, existing.list_id, existing.elem_id
-                    )
-                    deleted += 1
-                    logger.info("CalDAV PUT blob delete: %s", uid[:32])
-                except TutaAPIError as e:
-                    if e.status_code != 404:  # 404 = już usunięty, ignoruj
-                        logger.error("CalDAV PUT blob: błąd delete %s: %s", uid[:16], e)
+                candidates = uid_to_all.get(self._safe_uid(uid), [])
+                for existing in candidates:
+                    if not existing.list_id or not existing.elem_id:
+                        continue
+                    try:
+                        await client.delete_calendar_event_api(
+                            session, existing.list_id, existing.elem_id
+                        )
+                        deleted += 1
+                        logger.info("CalDAV PUT blob delete: %s (elem=%s)",
+                                    uid[:32], existing.elem_id[:12])
+                    except TutaAPIError as e:
+                        if e.status_code != 404:  # 404 = już usunięty, ignoruj
+                            logger.error("CalDAV PUT blob: błąd delete %s: %s", uid[:16], e)
+                            errors.append(str(e))
+                    except Exception as e:
+                        logger.error("CalDAV PUT blob: wyjątek delete %s: %s", uid[:16], e)
                         errors.append(str(e))
-                except Exception as e:
-                    logger.error("CalDAV PUT blob: wyjątek delete %s: %s", uid[:16], e)
-                    errors.append(str(e))
 
             self._event_cache.pop(email, None)
             if errors:

@@ -7,6 +7,28 @@ Versioning: [Semantic Versioning](https://semver.org/) — MAJOR.MINOR.PATCH.
 
 ---
 
+## [1.2.4] — 2026-05-28
+
+### Fixed
+- **Deleting the last calendar event no longer fails with "modification failed"** — Thunderbird
+  sends `PUT /` with an empty `VCALENDAR` (no `VEVENT` blocks) when deleting the last event.
+  The proxy was rejecting this with `400 Bad Request`, which Thunderbird reported as
+  "modification failed" and marked the calendar as "temporarily unavailable". Fixed by treating
+  an empty `VCALENDAR` as a valid diff: all UIDs from the last snapshot are deleted.
+
+- **Deleting a recurring event series now also removes override events** — when a recurring
+  event has a modified occurrence (stored as a separate Tuta event with the same UID and
+  `recurrenceId` set), deleting the series left the override orphaned in Tuta. On the next
+  sync, the proxy emitted a `RECURRENCE-ID` without its required master event, causing
+  Thunderbird to reject the entire calendar. Fixed by tracking all events per UID (`uid_to_all`)
+  and deleting every one of them when the UID is absent from the blob PUT body.
+
+- **Orphan override events no longer break CalDAV sync** — if a stale orphan override exists
+  in Tuta (override without a matching master), it is now emitted as a regular event without
+  `RECURRENCE-ID` rather than causing the calendar to be invalid.
+
+---
+
 ## [1.2.3] — 2026-05-28
 
 ### Fixed
