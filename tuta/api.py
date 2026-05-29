@@ -67,6 +67,7 @@ SYS_MODEL_VERSION     = os.environ.get("TUTA_SYS_VERSION",      "150")
 TUTANOTA_MODEL_VERSION = os.environ.get("TUTA_TUTANOTA_VERSION", "108")
 STORAGE_MODEL_VERSION  = os.environ.get("TUTA_STORAGE_VERSION",  "14")
 CLIENT_VERSION         = os.environ.get("TUTA_CLIENT_VERSION",   "346.260428.0")
+DRIVE_MODEL_VERSION    = os.environ.get("TUTA_DRIVE_VERSION",    "4")
 
 # Nagłówki dla endpointów sys
 TUTA_HEADERS = {
@@ -85,6 +86,18 @@ TUTANOTA_HEADERS = {
     "Content-Type": "application/json",
     "Accept": "application/json",
 }
+
+# Nagłówki dla endpointów drive (GroupType.File = "7", ArchiveDataType.DriveFile = "4")
+DRIVE_HEADERS = {
+    "v": DRIVE_MODEL_VERSION,
+    "cp": "5",
+    "cv": CLIENT_VERSION,
+    "Content-Type": "application/json",
+    "Accept": "application/json",
+}
+FILE_GROUP_TYPE = "7"
+ARCHIVE_DATA_TYPE_DRIVE = "4"
+BLOB_CHUNK_SIZE = 10 * 1024 * 1024  # 10 MB — maksymalny rozmiar pojedynczego bloba (limit serwera Tuta)
 
 # ---------------------------------------------------------------------------
 # Typy danych
@@ -2950,6 +2963,698 @@ class TutaClient:
             list_id[:12], len(elem_ids),
         )
 
+    # =========================================================================
+    # Drive (Tuta Drive) — GroupType.File = "7", API v4
+    # =========================================================================
+
+    async def _get_drive(self, url: str, token: str, params: dict = None) -> Any:
+        """GET dla endpointów drive (v=4)."""
+        headers = {"accessToken": token, **DRIVE_HEADERS}
+        async with self._http.get(url, headers=headers, params=params) as r:
+            if r.status == 200:
+                return await r.json(content_type=None)
+            body = await r.text()
+            self._check_version_mismatch(r.status, body)
+            raise TutaAPIError(r.status, body)
+
+    async def _post_drive(self, url: str, body: dict, token: str) -> Any:
+        """POST dla endpointów drive (v=4)."""
+        headers = {"accessToken": token, **DRIVE_HEADERS}
+        async with self._http.post(url, json=body, headers=headers) as r:
+            if r.status in (200, 201):
+                text = await r.text()
+                return json.loads(text) if text.strip() else None
+            text = await r.text()
+            self._check_version_mismatch(r.status, text)
+            raise TutaAPIError(r.status, text)
+
+    async def _put_drive(self, url: str, body: dict, token: str) -> None:
+        """PUT dla endpointów drive (v=4)."""
+        headers = {"accessToken": token, **DRIVE_HEADERS}
+        async with self._http.put(url, json=body, headers=headers) as r:
+            if r.status not in (200, 204):
+                text = await r.text()
+                self._check_version_mismatch(r.status, text)
+                raise TutaAPIError(r.status, text)
+
+    async def _delete_drive(self, url: str, body: dict, token: str) -> Any:
+        """DELETE z ciałem JSON dla endpointów drive (v=4)."""
+        headers = {"accessToken": token, **DRIVE_HEADERS}
+        async with self._http.request("DELETE", url, json=body, headers=headers) as r:
+            if r.status not in (200, 204):
+                text = await r.text()
+                self._check_version_mismatch(r.status, text)
+                raise TutaAPIError(r.status, text)
+            if r.status == 200:
+                return await r.json(content_type=None)
+            return None
+
+    async def get_drive_group_key(
+        self, session: Session
+    ) -> "tuple[str, bytes, str]":
+        """Zwraca (file_group_id, file_group_key, key_version) dla groupType='7' (File)."""
+        user_data = await self._get(
+            self._url("sys", "user", session.user_id),
+            token=session.access_token,
+        )
+        memberships = user_data.get("96", [])
+        for m in memberships:
+            if not isinstance(m, dict):
+                continue
+            if str(m.get("1030", "")) == FILE_GROUP_TYPE:
+                enc_key_b64 = m.get("27", "")
+                if not enc_key_b64:
+                    continue
+                g = m.get("29", "")
+                group_id = g[-1] if isinstance(g, list) else g
+                key_version = str(m.get("2246", "0") or "0")
+                group_key = aes_decrypt_tuta(session.user_group_key, base64.b64decode(enc_key_b64))
+                logger.debug("drive group_id=%s kv=%s", group_id[:12], key_version)
+                return group_id, group_key, key_version
+        raise TutaAPIError(0, "Brak grupy Drive (groupType=7) — konto bez dostępu do Tuta Drive")
+
+    async def get_drive_root(
+        self, session: Session, group_id: str, group_key: bytes, key_version: str
+    ) -> "tuple[list, list]":
+        """
+        Ładuje DriveGroupRoot i zwraca (root_id_tuple, trash_id_tuple).
+        Jeśli DriveGroupRoot nie istnieje (404), inicjalizuje Drive.
+        """
+        url = self._url("drive", "drivegrouproot", group_id)
+        try:
+            raw = await self._get_drive(url, token=session.access_token)
+        except TutaAPIError as e:
+            if e.status_code == 404:
+                raw = await self._init_drive_root(session, group_id, group_key, key_version)
+            else:
+                raise
+        # root i trash są LIST_ELEMENT_ASSOCIATION_GENERATED One → [[listId, elemId]]
+        root = raw.get("53", [[]])[0] if isinstance(raw.get("53"), list) else []
+        trash = raw.get("54", [[]])[0] if isinstance(raw.get("54"), list) else []
+        if not root or not trash:
+            raise TutaAPIError(0, f"DriveGroupRoot bez root/trash: {raw!r}")
+        return root, trash
+
+    async def _init_drive_root(
+        self, session: Session, group_id: str, group_key: bytes, key_version: str
+    ) -> dict:
+        """POST DriveService — tworzy root i trash foldery Drive dla grupy."""
+        root_sk = os.urandom(32)
+        trash_sk = os.urandom(32)
+        enc_root_sk = aes_encrypt_tuta(group_key, root_sk, add_padding=False)
+        enc_trash_sk = aes_encrypt_tuta(group_key, trash_sk, add_padding=False)
+        body = {
+            "62": "0",   # _format
+            "64": base64.b64encode(enc_root_sk).decode(),    # ownerEncRootFolderSessionKey
+            "65": base64.b64encode(enc_trash_sk).decode(),   # ownerEncTrashFolderSessionKey
+            "113": key_version,                               # ownerKeyVersion
+            "63": group_id,                                   # fileGroupId (ELEMENT_ASSOCIATION)
+        }
+        url = self._url("drive", "driveservice")
+        await self._post_drive(url, body, session.access_token)
+        return await self._get_drive(
+            self._url("drive", "drivegrouproot", group_id),
+            token=session.access_token,
+        )
+
+    def _decrypt_drive_folder(self, raw: dict, group_key: bytes) -> "Optional[DriveFolder]":
+        """Odszyfrowuje DriveFolder z surowego JSON API."""
+        try:
+            id_raw = raw.get("2", ["", ""])
+            id_tuple = list(id_raw) if isinstance(id_raw, list) else ["", ""]
+            enc_sk_b64 = raw.get("6", "")
+            if not enc_sk_b64:
+                return None
+            sk = aes_decrypt_tuta(group_key, base64.b64decode(enc_sk_b64))
+            name_enc = raw.get("9", "")
+            name = aes_decrypt_tuta(sk, base64.b64decode(name_enc)).decode("utf-8") if name_enc else ""
+            folder_type = str(raw.get("8", "0"))
+            parent_raw = raw.get("12")
+            parent = list(parent_raw[0]) if isinstance(parent_raw, list) and parent_raw else None
+            files_list_id_raw = raw.get("38", "")
+            if isinstance(files_list_id_raw, list) and files_list_id_raw:
+                files_list_id = str(files_list_id_raw[0])
+            elif isinstance(files_list_id_raw, str):
+                files_list_id = files_list_id_raw
+            else:
+                files_list_id = ""
+            created_ms = int(raw.get("10", 0) or 0)
+            updated_ms = int(raw.get("11", 0) or 0)
+            return DriveFolder(
+                id_tuple=id_tuple,
+                name=name,
+                folder_type=folder_type,
+                parent=parent,
+                files_list_id=files_list_id,
+                created_ms=created_ms,
+                updated_ms=updated_ms,
+                raw=raw,
+            )
+        except Exception as e:
+            logger.warning("_decrypt_drive_folder error: %s raw=%r", e, raw)
+            return None
+
+    def _decrypt_drive_file(self, raw: dict, group_key: bytes) -> "Optional[DriveFile]":
+        """Odszyfrowuje DriveFile z surowego JSON API."""
+        try:
+            id_raw = raw.get("16", ["", ""])
+            id_tuple = list(id_raw) if isinstance(id_raw, list) else ["", ""]
+            enc_sk_b64 = raw.get("20", "")
+            if not enc_sk_b64:
+                return None
+            sk = aes_decrypt_tuta(group_key, base64.b64decode(enc_sk_b64))
+            name_enc = raw.get("22", "")
+            name = aes_decrypt_tuta(sk, base64.b64decode(name_enc)).decode("utf-8") if name_enc else ""
+            mime_enc = raw.get("24", "")
+            mime = aes_decrypt_tuta(sk, base64.b64decode(mime_enc)).decode("utf-8") if mime_enc else "application/octet-stream"
+            size = int(raw.get("23", 0) or 0)
+            folder_raw = raw.get("27", [])
+            folder = list(folder_raw[0]) if isinstance(folder_raw, list) and folder_raw else ["", ""]
+            blobs = raw.get("28", [])
+            created_ms = int(raw.get("25", 0) or 0)
+            updated_ms = int(raw.get("26", 0) or 0)
+            return DriveFile(
+                id_tuple=id_tuple,
+                name=name,
+                size=size,
+                mime_type=mime,
+                folder=folder,
+                blobs=blobs,
+                created_ms=created_ms,
+                updated_ms=updated_ms,
+                raw=raw,
+            )
+        except Exception as e:
+            logger.warning("_decrypt_drive_file error: %s raw=%r", e, raw)
+            return None
+
+    async def get_drive_folder(
+        self, session: Session, group_key: bytes, folder_id: list
+    ) -> "Optional[DriveFolder]":
+        """Ładuje i odszyfrowuje pojedynczy DriveFolder po IdTuple."""
+        list_id, elem_id = folder_id[0], folder_id[1]
+        url = self._url("drive", "drivefolder", list_id, elem_id)
+        raw = await self._get_drive(url, token=session.access_token)
+        return self._decrypt_drive_folder(raw, group_key)
+
+    async def list_drive_folder_contents(
+        self, session: Session, group_key: bytes, folder_id: list
+    ) -> "tuple[list[DriveFolder], list[DriveFile]]":
+        """
+        Zwraca (subfolders, files) dla podanego folderu Drive.
+
+        Przepływ:
+          1. Załaduj DriveFolder → pobierz files_list_id (pole 38)
+          2. GET wszystkich DriveFileRef z tej listy
+          3. Dla każdego ref: załaduj DriveFile (ref.file) lub DriveFolder (ref.folder)
+        """
+        folder = await self.get_drive_folder(session, group_key, folder_id)
+        if not folder or not folder.files_list_id:
+            logger.warning("list_drive_folder_contents: folder=%s brak/pusty files_list_id (folder=%r)", folder_id, folder)
+            return [], []
+        logger.debug("list_drive_folder_contents: folder=%s files_list_id=%r", folder_id, folder.files_list_id)
+
+        # Pobierz wszystkie DriveFileRef z listy (paginacja jak kontakty)
+        refs = []
+        start = "AAAAAAAAAAAA"
+        for _ in range(50):
+            page = await self._get_drive(
+                self._url("drive", "drivefileref", folder.files_list_id),
+                token=session.access_token,
+                params={"start": start, "count": "500", "reverse": "false"},
+            )
+            if not isinstance(page, list) or not page:
+                break
+            refs.extend(page)
+            if len(page) < 500:
+                break
+            last = page[-1]
+            last_id = last.get("32", "")
+            start = last_id[-1] if isinstance(last_id, list) else (last_id or start)
+
+        logger.debug("list_drive_folder_contents: %d refs, sample=%r", len(refs), refs[:2] if refs else [])
+
+        # Wydziel ID plików i podfolderów
+        file_ids: list[list] = []
+        subfolder_ids: list[list] = []
+        for ref in refs:
+            file_raw = ref.get("36")
+            folder_raw = ref.get("37")
+            if isinstance(file_raw, list) and file_raw:
+                fid = list(file_raw[0]) if isinstance(file_raw[0], list) else list(file_raw)
+                if fid and fid[0]:
+                    file_ids.append(fid)
+            elif isinstance(folder_raw, list) and folder_raw:
+                fid = list(folder_raw[0]) if isinstance(folder_raw[0], list) else list(folder_raw)
+                if fid and fid[0]:
+                    subfolder_ids.append(fid)
+
+        logger.debug("list_drive_folder_contents: file_ids=%s subfolder_ids=%s", file_ids, subfolder_ids)
+
+        # Załaduj pliki i podfoldery (równolegle)
+        async def load_file(fid):
+            url = self._url("drive", "drivefile", fid[0], fid[1])
+            try:
+                raw = await self._get_drive(url, token=session.access_token)
+                return self._decrypt_drive_file(raw, group_key)
+            except TutaAPIError as e:
+                logger.warning("load_file %s: %s", fid, e)
+                return None
+
+        async def load_subfolder(fid):
+            try:
+                return await self.get_drive_folder(session, group_key, fid)
+            except TutaAPIError as e:
+                logger.warning("load_subfolder %s: %s", fid, e)
+                return None
+
+        import asyncio as _aio
+        files_raw = await _aio.gather(*[load_file(fid) for fid in file_ids])
+        folders_raw = await _aio.gather(*[load_subfolder(fid) for fid in subfolder_ids])
+
+        files = [f for f in files_raw if f is not None]
+        folders = [f for f in folders_raw if f is not None]
+        return folders, files
+
+    async def download_drive_file_data(
+        self, session: Session, group_key: bytes, drive_file: "DriveFile"
+    ) -> bytes:
+        """
+        Pobiera i odszyfrowuje dane pliku Drive z blob storage.
+        Zwraca pełne odszyfrowane bajty pliku.
+        """
+        import json as _json
+        import secrets as _secrets
+        import struct
+
+        blobs = drive_file.blobs
+        if not blobs:
+            return b""
+
+        archive_id = blobs[0].get("1884", "")
+        file_list_id = drive_file.id_tuple[0] if len(drive_file.id_tuple) > 0 else ""
+        file_elem_id = drive_file.id_tuple[1] if len(drive_file.id_tuple) > 1 else ""
+
+        # Token odczytu z ArchiveDataType.DriveFile = "4"
+        rnd_read = _secrets.token_urlsafe(4)[:6]
+        rnd_inst = _secrets.token_urlsafe(4)[:6]
+        token_body = {
+            "78": "0",
+            "80": [],
+            "180": ARCHIVE_DATA_TYPE_DRIVE,
+            "181": [{
+                "176": rnd_read,
+                "177": archive_id,
+                "178": file_list_id,
+                "179": [{"173": rnd_inst, "174": file_elem_id}],
+            }],
+        }
+        token_headers = {
+            "accessToken": session.access_token,
+            "v": STORAGE_MODEL_VERSION,
+            "Content-Type": "application/json",
+        }
+        async with self._http.post(
+            self.base_url + "/rest/storage/blobaccesstokenservice",
+            data=_json.dumps(token_body, separators=(",", ":")).encode(),
+            headers=token_headers,
+        ) as r:
+            if r.status not in (200, 201):
+                text = await r.text()
+                raise TutaAPIError(r.status, f"Drive blob token: {text}")
+            token_resp = await r.json(content_type=None)
+
+        access_info = token_resp.get("161", [{}])[0]
+        blob_token = access_info.get("159", "")
+        servers = access_info.get("160", [])
+        if not servers:
+            raise TutaAPIError(0, "Brak serwerów blob dla Drive file")
+        server_url = servers[0].get("156", "")
+
+        # Odszyfruj klucz sesji pliku
+        enc_sk_b64 = drive_file.raw.get("20", "")
+        file_sk = aes_decrypt_tuta(group_key, base64.b64decode(enc_sk_b64))
+
+        # Pobierz i odszyfruj każdy blob
+        from .crypto import aes_decrypt_tuta as _aes_dec
+        result_chunks: list[bytes] = []
+        for blob in blobs:
+            blob_archive_id = blob.get("1884", "")
+            blob_id = blob.get("1906", "")
+            entry_id = _secrets.token_urlsafe(4)[:6]
+            blob_get_in = {
+                "51": "0",
+                "52": blob_archive_id,
+                "110": None,
+                "193": [{"145": entry_id, "146": blob_id}],
+            }
+            params = {
+                "blobAccessToken": blob_token,
+                "accessToken": session.access_token,
+            }
+            async with self._http.request(
+                "GET",
+                f"{server_url}/rest/storage/blobservice",
+                headers={"Content-Type": "application/json", "v": STORAGE_MODEL_VERSION},
+                params=params,
+                data=_json.dumps(blob_get_in).encode(),
+            ) as r:
+                if r.status != 200:
+                    body = await r.text()
+                    raise TutaAPIError(r.status, f"Drive blob GET: {body}")
+                raw_bytes = await r.read()
+
+            # Format: [count:4B][blobId:9B][hash:6B][size:4B][data:N B] per blob
+            if len(raw_bytes) < 4:
+                continue
+            count = struct.unpack(">i", raw_bytes[:4])[0]
+            offset = 4
+            for _ in range(count):
+                if offset + 19 > len(raw_bytes):
+                    break
+                chunk_size = struct.unpack(">i", raw_bytes[offset + 15: offset + 19])[0]
+                chunk = raw_bytes[offset + 19: offset + 19 + chunk_size]
+                decrypted = _aes_dec(file_sk, chunk)
+                result_chunks.append(decrypted)
+                offset += 19 + chunk_size
+
+        return b"".join(result_chunks)
+
+    async def _get_drive_blob_write_token(
+        self, session: Session, file_group_id: str
+    ) -> "tuple[str, str]":
+        """Pobiera write token dla Drive blob storage (ArchiveDataType.DriveFile = '4')."""
+        import json as _json
+        body = {
+            "78": "0",
+            "80": [{"74": _random_custom_id(), "75": file_group_id}],
+            "180": ARCHIVE_DATA_TYPE_DRIVE,
+            "181": [],
+        }
+        headers = {
+            "accessToken": session.access_token,
+            "v": STORAGE_MODEL_VERSION,
+            "Content-Type": "application/json",
+        }
+        async with self._http.post(
+            self.base_url + "/rest/storage/blobaccesstokenservice",
+            data=_json.dumps(body, separators=(",", ":")).encode(),
+            headers=headers,
+        ) as r:
+            if r.status not in (200, 201):
+                text = await r.text()
+                raise TutaAPIError(r.status, f"Drive write token: {text}")
+            resp = await r.json(content_type=None)
+
+        access_info = resp.get("161", {})
+        if isinstance(access_info, list):
+            access_info = access_info[0] if access_info else {}
+        blob_token = access_info.get("159", "")
+        servers = access_info.get("160", [])
+        if not servers:
+            raise TutaAPIError(0, "Brak serwerów blob dla Drive upload")
+        server_url = servers[0].get("156", "")
+        return blob_token, server_url
+
+    async def create_drive_folder_api(
+        self,
+        session: Session,
+        group_key: bytes,
+        key_version: str,
+        name: str,
+        parent_id: list,
+    ) -> "DriveFolder":
+        """POST DriveFolderService — tworzy nowy folder Drive."""
+        sk = os.urandom(32)
+        enc_sk = aes_encrypt_tuta(group_key, sk, add_padding=False)
+        enc_name = aes_encrypt_tuta(sk, name.encode("utf-8"))
+        body = {
+            "85": "0",                                         # _format
+            "86": base64.b64encode(enc_name).decode(),        # folderName (encrypted)
+            "87": base64.b64encode(enc_sk).decode(),          # ownerEncSessionKey
+            "114": key_version,                                # ownerKeyVersion
+            "88": [list(parent_id)],                          # parent (LIST_ELEMENT_ASSOC One)
+        }
+        url = self._url("drive", "drivefolderservice")
+        resp = await self._post_drive(url, body, session.access_token)
+        # DriveFolderServicePostOut.folder (field 91) → [[listId, elemId]]
+        folder_id_raw = resp.get("91", [[]])
+        folder_id = list(folder_id_raw[0]) if isinstance(folder_id_raw, list) and folder_id_raw else []
+        if not folder_id:
+            raise TutaAPIError(0, f"DriveFolderService: brak folder ID w odpowiedzi {resp!r}")
+        raw_folder = await self._get_drive(
+            self._url("drive", "drivefolder", folder_id[0], folder_id[1]),
+            token=session.access_token,
+        )
+        result = self._decrypt_drive_folder(raw_folder, group_key)
+        if not result:
+            raise TutaAPIError(0, "Nie można odszyfrować nowo utworzonego folderu")
+        logger.info("create_drive_folder_api: '%s' in %s", name, parent_id)
+        return result
+
+    async def upload_drive_file_api(
+        self,
+        session: Session,
+        group_id: str,
+        group_key: bytes,
+        key_version: str,
+        name: str,
+        mime: str,
+        data: bytes,
+        parent_id: list,
+    ) -> "DriveFile":
+        """
+        Szyfruje i uploaduje plik do Tuta Drive.
+        Flow:
+          1. Generuj file_sk (AES-256)
+          2. Zaszyfruj dane pliku (AesCbcThenHmac)
+          3. Upload do blob storage (ArchiveDataType.DriveFile)
+          4. POST DriveItemService z DriveUploadedFile agregat
+          5. Załaduj i zwróć DriveFile
+        """
+        logger.info("upload_drive_file_api: start '%s' %dB → parent=%s", name, len(data), parent_id)
+        file_sk = os.urandom(32)
+        enc_file_sk = aes_encrypt_tuta(group_key, file_sk, add_padding=False)
+
+        # Podziel dane na chunki BLOB_CHUNK_SIZE i zaszyfruj każdy osobno tym samym file_sk.
+        # Tuta uploaduje każdy chunk oddzielnie i zbiera listę blobReferenceTokenów.
+        raw_chunks = [data[i:i + BLOB_CHUNK_SIZE] for i in range(0, len(data), BLOB_CHUNK_SIZE)]
+        if not raw_chunks:
+            raw_chunks = [b""]  # pusty plik — jeden pusty chunk
+
+        blob_token, server_url = await self._get_drive_blob_write_token(session, group_id)
+        logger.info("upload_drive_file_api: blob token OK, server=%s, %d chunk(s)", server_url, len(raw_chunks))
+
+        # Timeout per chunk: 10 min — wysyłka 10 MB może trwać długo na wolnym łączu.
+        # Retry na błędy sieciowe (timeout, reset) — nie retryujemy 4xx (błąd serwera, nie sieć).
+        blob_timeout = aiohttp.ClientTimeout(total=600)
+        CHUNK_RETRIES = 3
+
+        reference_tokens = []
+        for idx, chunk in enumerate(raw_chunks):
+            enc_chunk = aes_encrypt_tuta(file_sk, chunk)
+            blob_hash = base64.b64encode(hashlib.sha256(enc_chunk).digest()[:6]).decode()
+
+            blob_ref_token = None
+            for attempt in range(CHUNK_RETRIES):
+                try:
+                    async with self._http.post(
+                        f"{server_url}/rest/storage/blobservice",
+                        data=enc_chunk,
+                        headers={"Content-Type": "application/octet-stream", "v": STORAGE_MODEL_VERSION},
+                        params={"blobAccessToken": blob_token, "blobHash": blob_hash, "accessToken": session.access_token},
+                        timeout=blob_timeout,
+                    ) as r:
+                        if r.status not in (200, 201):
+                            text = await r.text()
+                            logger.error("upload_drive_file_api: chunk %d/%d attempt %d status %d: %s",
+                                         idx + 1, len(raw_chunks), attempt + 1, r.status, text[:200])
+                            raise TutaAPIError(r.status, f"Drive blob upload chunk {idx + 1}: {text}")
+                        blob_resp = await r.json(content_type=None)
+
+                    blob_ref_token = blob_resp.get("127") or ""
+                    if not blob_ref_token and isinstance(blob_resp.get("208"), list) and blob_resp["208"]:
+                        blob_ref_token = blob_resp["208"][0].get("1992", "")
+                    if not blob_ref_token:
+                        raise TutaAPIError(0, f"Brak blobReferenceToken chunk {idx + 1}: {blob_resp!r}")
+                    break  # sukces
+
+                except TutaAPIError as e:
+                    if e.status_code == 403 and attempt < CHUNK_RETRIES - 1:
+                        # Token wygasł podczas długiego uploadu — pobierz nowy i ponów
+                        logger.warning("upload_drive_file_api: chunk %d/%d token 403 — odświeżam blob token",
+                                       idx + 1, len(raw_chunks))
+                        blob_token, server_url = await self._get_drive_blob_write_token(session, group_id)
+                    else:
+                        raise
+                except (asyncio.TimeoutError, aiohttp.ClientError) as e:
+                    # Błąd sieciowy — warto spróbować jeszcze raz
+                    if attempt < CHUNK_RETRIES - 1:
+                        wait = 2 ** attempt   # 1s, 2s
+                        logger.warning("upload_drive_file_api: chunk %d/%d attempt %d network error: %s — retry in %ds",
+                                       idx + 1, len(raw_chunks), attempt + 1, e, wait)
+                        await asyncio.sleep(wait)
+                    else:
+                        raise TutaAPIError(0, f"Chunk {idx + 1} network error after {CHUNK_RETRIES} attempts: {e}") from e
+
+            reference_tokens.append({"1991": _random_custom_id(), "1992": blob_ref_token})
+            logger.info("upload_drive_file_api: chunk %d/%d uploaded, refToken=%s...",
+                        idx + 1, len(raw_chunks), blob_ref_token[:12])
+
+        # Zaszyfruj pola nazwy i MIME w DriveUploadedFile
+        enc_filename = aes_encrypt_tuta(file_sk, name.encode("utf-8"))
+        enc_mime = aes_encrypt_tuta(file_sk, (mime or "application/octet-stream").encode("utf-8"))
+
+        uploaded_file = {
+            "56": _random_custom_id(),                           # _id
+            "57": base64.b64encode(enc_filename).decode(),       # fileName (encrypted)
+            "58": base64.b64encode(enc_mime).decode(),           # mimeType (encrypted)
+            "59": base64.b64encode(enc_file_sk).decode(),        # ownerEncSessionKey
+            "112": key_version,                                   # ownerKeyVersion
+            "60": reference_tokens,                              # blobReferenceTokens (jeden per chunk)
+        }
+        body = {
+            "68": "0",              # _format
+            "69": [list(parent_id)],  # parent (LIST_ELEMENT_ASSOC One)
+            "70": [uploaded_file],  # uploadedFile (AGGREGATION One) → zawsze lista
+        }
+        url = self._url("drive", "driveitemservice")
+        resp = await self._post_drive(url, body, session.access_token)
+        # DriveItemPostOut.createdFile (field 73) → [[listId, elemId]]
+        created_raw = resp.get("73", [[]])
+        created_id = list(created_raw[0]) if isinstance(created_raw, list) and created_raw else []
+        if not created_id:
+            raise TutaAPIError(0, f"DriveItemService: brak createdFile w odpowiedzi {resp!r}")
+        logger.info("upload_drive_file_api: createdFile=%s", created_id)
+        raw_file = await self._get_drive(
+            self._url("drive", "drivefile", created_id[0], created_id[1]),
+            token=session.access_token,
+        )
+        result = self._decrypt_drive_file(raw_file, group_key)
+        if not result:
+            raise TutaAPIError(0, "Nie można odszyfrować nowo wgranego pliku")
+        logger.info("upload_drive_file_api: OK '%s' (%d B) → %s", name, len(data), parent_id)
+        return result
+
+    async def rename_drive_item_api(
+        self,
+        session: Session,
+        group_key: bytes,
+        item_raw: dict,
+        new_name: str,
+        is_file: bool,
+    ) -> None:
+        """PUT DriveItemService — zmiana nazwy pliku lub folderu Drive."""
+        # Odszyfruj klucz sesji elementu
+        sk_field = "20" if is_file else "6"
+        enc_sk_b64 = item_raw.get(sk_field, "")
+        item_sk = aes_decrypt_tuta(group_key, base64.b64decode(enc_sk_b64))
+
+        # Zaszyfruj nową nazwę kluczem sesji elementu
+        enc_new_name = aes_encrypt_tuta(item_sk, new_name.encode("utf-8"))
+        id_field = "16" if is_file else "2"
+        id_raw = item_raw.get(id_field, ["", ""])
+        id_tuple = list(id_raw) if isinstance(id_raw, list) else ["", ""]
+
+        body = {
+            "75": "0",                                          # _format
+            "76": base64.b64encode(enc_new_name).decode(),     # newName (encrypted)
+            "77": [list(id_tuple)] if is_file else [],         # file (ZeroOrOne)
+            "78": [] if is_file else [list(id_tuple)],         # folder (ZeroOrOne)
+        }
+        url = self._url("drive", "driveitemservice")
+        await self._put_drive(url, body, session.access_token)
+        logger.info("rename_drive_item_api: %s → '%s'", id_tuple, new_name)
+
+    async def move_drive_items_api(
+        self,
+        session: Session,
+        group_key: bytes,
+        file_items: "list[DriveFile]",
+        folder_items: "list[DriveFolder]",
+        dest_folder_id: list,
+        rename_map: "Optional[dict]" = None,
+    ) -> None:
+        """
+        PUT DriveFolderService — przenosi pliki/foldery do innego folderu.
+        Opcjonalnie zmienia nazwy (rename_map: {old_name: new_name}).
+        """
+        items = []
+        for f in file_items:
+            new_name = (rename_map or {}).get(f.name)
+            if new_name:
+                enc_sk_b64 = f.raw.get("20", "")
+                item_sk = aes_decrypt_tuta(group_key, base64.b64decode(enc_sk_b64))
+                enc_new_name = aes_encrypt_tuta(item_sk, new_name.encode("utf-8"))
+                enc_new_name_b64 = base64.b64encode(enc_new_name).decode()
+            else:
+                enc_new_name_b64 = None
+            items.append({
+                "93": _random_custom_id(),
+                "94": enc_new_name_b64,
+                "95": [list(f.id_tuple)],
+                "96": [],
+            })
+        for fld in folder_items:
+            new_name = (rename_map or {}).get(fld.name)
+            if new_name:
+                enc_sk_b64 = fld.raw.get("6", "")
+                item_sk = aes_decrypt_tuta(group_key, base64.b64decode(enc_sk_b64))
+                enc_new_name = aes_encrypt_tuta(item_sk, new_name.encode("utf-8"))
+                enc_new_name_b64 = base64.b64encode(enc_new_name).decode()
+            else:
+                enc_new_name_b64 = None
+            items.append({
+                "93": _random_custom_id(),
+                "94": enc_new_name_b64,
+                "95": [],
+                "96": [list(fld.id_tuple)],
+            })
+        body = {
+            "98": "0",              # _format
+            "99": items,            # items (AGGREGATION Any)
+            "100": [list(dest_folder_id)],  # destination (LIST_ELEMENT_ASSOC One)
+        }
+        url = self._url("drive", "drivefolderservice")
+        await self._put_drive(url, body, session.access_token)
+        logger.info(
+            "move_drive_items_api: %d files, %d folders → %s",
+            len(file_items), len(folder_items), dest_folder_id,
+        )
+
+    async def delete_drive_items_api(
+        self,
+        session: Session,
+        file_id_tuples: "list[list]",
+        folder_id_tuples: "list[list]",
+        permanent: bool = False,
+    ) -> None:
+        """
+        Usuwa elementy Drive.
+        permanent=False → przenieś do kosza (DriveFolderServiceDeleteIn)
+        permanent=True  → usuń z kosza na stałe (DriveItemDeleteIn)
+        """
+        if permanent:
+            body = {
+                "80": "0",
+                "81": [list(fid) for fid in file_id_tuples],
+                "82": [list(fid) for fid in folder_id_tuples],
+            }
+            url = self._url("drive", "driveitemservice")
+        else:
+            body = {
+                "102": "0",
+                "105": False,
+                "103": [list(fid) for fid in file_id_tuples],
+                "104": [list(fid) for fid in folder_id_tuples],
+            }
+            url = self._url("drive", "drivefolderservice")
+        await self._delete_drive(url, body, session.access_token)
+        logger.info(
+            "delete_drive_items_api: %d files, %d folders (permanent=%s)",
+            len(file_id_tuples), len(folder_id_tuples), permanent,
+        )
+
 
 def _random_custom_id() -> str:
     """Generuje losowy CustomId (base64url, 4 bajty = 6 znaków) — format jak w importerze Tuty."""
@@ -3069,6 +3774,31 @@ class Contact:
     # pozostałe
     birthday_iso: str = ""
     comment: str = ""
+
+
+@dataclass
+class DriveFolder:
+    id_tuple: list           # [listId, elemId]
+    name: str
+    folder_type: str         # "0"=Regular, "1"=Root, "2"=Trash
+    parent: Optional[list]   # [listId, elemId] lub None
+    files_list_id: str       # listId dla DriveFileRef (pole 38)
+    created_ms: int
+    updated_ms: int
+    raw: dict = field(default_factory=dict)
+
+
+@dataclass
+class DriveFile:
+    id_tuple: list           # [listId, elemId]
+    name: str
+    size: int
+    mime_type: str
+    folder: list             # [listId, elemId] folderu nadrzędnego
+    blobs: list              # surowe agregaty Blob (1884=archiveId, 1906=blobId)
+    created_ms: int
+    updated_ms: int
+    raw: dict = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------

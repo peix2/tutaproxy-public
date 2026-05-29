@@ -11,6 +11,8 @@ Zmienne środowiskowe:
     TUTA_CALDAV_PORT    — domyślnie 5232
     TUTA_CARDDAV_HOST   — domyślnie 0.0.0.0
     TUTA_CARDDAV_PORT   — domyślnie 5233
+    TUTA_WEBDAV_HOST    — domyślnie 0.0.0.0
+    TUTA_WEBDAV_PORT    — domyślnie 5234
     TUTA_CACHE_PATH     — domyślnie /data/tuta_cache.db
     LOG_LEVEL           — domyślnie INFO
     LOG_FILE            — jeśli ustawiony, logi tylko do pliku
@@ -60,6 +62,7 @@ from tuta.imap_server import IMAPServer
 from tuta.smtp_server import SMTPServer
 from tuta.caldav_server import CalDAVServer
 from tuta.carddav_server import CardDAVServer
+from tuta.webdav_server import WebDAVServer
 
 
 async def main() -> None:
@@ -71,22 +74,28 @@ async def main() -> None:
     caldav_port  = int(os.environ.get("TUTA_CALDAV_PORT",  "5232"))
     carddav_host = os.environ.get("TUTA_CARDDAV_HOST", "0.0.0.0")
     carddav_port = int(os.environ.get("TUTA_CARDDAV_PORT", "5233"))
+    webdav_host  = os.environ.get("TUTA_WEBDAV_HOST",  "0.0.0.0")
+    webdav_port  = int(os.environ.get("TUTA_WEBDAV_PORT",  "5234"))
     cache_path   = os.environ.get("TUTA_CACHE_PATH",   "/data/tuta_cache.db")
 
     imap    = IMAPServer(host=imap_host, port=imap_port, cache_path=cache_path)
     smtp    = SMTPServer(host=smtp_host, port=smtp_port)
     caldav  = CalDAVServer(host=caldav_host, port=caldav_port)
     carddav = CardDAVServer(host=carddav_host, port=carddav_port)
+    webdav  = WebDAVServer(host=webdav_host, port=webdav_port)
 
     print(f"tuta-proxy IMAP    {imap_host}:{imap_port}")
     print(f"tuta-proxy SMTP    {smtp_host}:{smtp_port}")
     print(f"tuta-proxy CalDAV  {caldav_host}:{caldav_port}")
     print(f"tuta-proxy CardDAV {carddav_host}:{carddav_port}")
+    print(f"tuta-proxy WebDAV  {webdav_host}:{webdav_port}  (Tuta Drive)")
     print(f"cache: {cache_path}")
     print("Zatrzymaj: Ctrl+C")
 
     try:
-        await asyncio.gather(imap.start(), smtp.start(), caldav.start(), carddav.start())
+        await asyncio.gather(
+            imap.start(), smtp.start(), caldav.start(), carddav.start(), webdav.start()
+        )
     except asyncio.CancelledError:
         pass
     finally:

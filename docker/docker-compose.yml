@@ -10,6 +10,7 @@ services:
       - "127.0.0.1:1025:1025"    # SMTP    — tylko localhost hosta, nie z sieci
       - "127.0.0.1:5232:5232"    # CalDAV  — tylko localhost hosta, nie z sieci
       - "127.0.0.1:5233:5233"    # CardDAV — tylko localhost hosta, nie z sieci
+      - "127.0.0.1:5234:5234"    # WebDAV  — tylko localhost hosta, nie z sieci
     volumes:
       - tuta_cache:/data
     environment:

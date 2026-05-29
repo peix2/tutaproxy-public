@@ -7,6 +7,29 @@ Versioning: [Semantic Versioning](https://semver.org/) — MAJOR.MINOR.PATCH.
 
 ---
 
+## [1.3.0] — 2026-05-29
+
+### Added
+- **WebDAV server / Tuta Drive** — new WebDAV server on port `5234` exposes your Tuta Drive
+  file storage to any WebDAV client. Mount it with davfs2, rclone, GNOME Files (Nautilus),
+  macOS Finder, or Windows network drive. Supports browse, download, upload, rename, move,
+  create folder, and delete.
+  - Large files are automatically split into 10 MB chunks and uploaded sequentially.
+  - Uploads are retried up to 3 times on network errors.
+  - Blob access token is refreshed automatically if it expires mid-upload.
+  - davfs2 duplicate PUT deduplication: if davfs2 sends a second PUT for the same file
+    (it does this when the first takes a long time), the second request is a no-op.
+  - Newly uploaded files are pinned in the local listing for 5 minutes to work around
+    Tuta Drive's eventual consistency (new files may not appear in the API listing immediately).
+- `run_webdav.py` — standalone entry point for the WebDAV server.
+- `TUTA_WEBDAV_HOST` / `TUTA_WEBDAV_PORT` environment variables.
+
+### Changed
+- `run_proxy.py` now starts the WebDAV server alongside IMAP, SMTP, CalDAV, and CardDAV.
+- Docker: port `5234` (WebDAV) is now exposed and mapped to `127.0.0.1:5234`.
+
+---
+
 ## [1.2.4] — 2026-05-28
 
 ### Fixed

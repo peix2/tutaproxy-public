@@ -1,6 +1,6 @@
 # tuta-proxy
 
-An unofficial IMAP/SMTP proxy that lets you access your [Tuta](https://tuta.com) email account from any standard email client — Thunderbird, Apple Mail, Mutt, or anything else that speaks IMAP and SMTP.
+An unofficial local proxy that lets you access your [Tuta](https://tuta.com) account from any standard client — email, calendar, contacts, and file storage.
 
 > **Disclaimer:** This project is not affiliated with, endorsed by, or connected to Tutao GmbH in any way. Use at your own risk. "Tuta" and "Tutanota" are trademarks of Tutao GmbH.
 
@@ -8,7 +8,7 @@ An unofficial IMAP/SMTP proxy that lets you access your [Tuta](https://tuta.com)
 
 ## Why
 
-Tuta is a privacy-focused email service with strong end-to-end encryption. It only officially supports its own apps (web, desktop, Android, iOS). This proxy bridges the gap: it runs locally on your machine, speaks IMAP/SMTP to your email client, and translates those requests to Tuta's native API — including proper E2E encryption handling.
+Tuta is a privacy-focused email service with strong end-to-end encryption. It only officially supports its own apps (web, desktop, Android, iOS). This proxy bridges the gap: it runs locally on your machine and translates standard protocols (IMAP, SMTP, CalDAV, CardDAV, WebDAV) to Tuta's native API — including full E2E encryption handling.
 
 ---
 
@@ -23,10 +23,11 @@ Tuta is a privacy-focused email service with strong end-to-end encryption. It on
 - **Folder management** — create, rename, delete folders; move messages between folders (IMAP COPY)
 - **CalDAV (calendar sync)** — CalDAV server exposes your Tuta calendars to any CalDAV client (Thunderbird, Apple Calendar, etc.); supports reading, creating, updating, and deleting events; recurrence rules (RRULE) fully supported
 - **CardDAV (contact sync)** — CardDAV server exposes your Tuta contacts to any CardDAV client (CardBook for Thunderbird, Apple Contacts, etc.); supports reading, creating, updating, and deleting contacts (vCard 3.0)
+- **WebDAV / Tuta Drive** — WebDAV server on port `5234` exposes your Tuta Drive file storage; mount it with davfs2, rclone, Nautilus, or any WebDAV client; large files are chunked automatically
 - **Push updates** — IMAP IDLE support so your client gets notified of new mail without polling
 - **Flags** — read/unread, deleted (with EXPUNGE)
 - **SQLite cache** — folder list and message IDs are cached locally to speed up reconnects
-- **Docker-ready** — single container runs IMAP, SMTP, CalDAV, and CardDAV
+- **Docker-ready** — single container runs all five servers (IMAP, SMTP, CalDAV, CardDAV, WebDAV)
 
 ---
 
@@ -45,11 +46,12 @@ cd tutaproxy-public/docker
 docker-compose up -d --build
 ```
 
-All four servers start automatically:
+All five servers start automatically:
 - IMAP on `127.0.0.1:1143`
 - SMTP on `127.0.0.1:1025`
 - CalDAV on `127.0.0.1:5232`
 - CardDAV on `127.0.0.1:5233`
+- WebDAV (Tuta Drive) on `127.0.0.1:5234`
 
 Cache is stored in a Docker volume and survives container restarts.
 
@@ -64,7 +66,7 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 
-# Start IMAP, SMTP, CalDAV, and CardDAV:
+# Start all servers (IMAP, SMTP, CalDAV, CardDAV, WebDAV):
 python run_proxy.py
 
 # Or start separately:
@@ -72,6 +74,7 @@ python run_imap.py
 python run_smtp.py
 python run_caldav.py
 python run_carddav.py
+python run_webdav.py
 ```
 
 ### Environment variables
@@ -86,6 +89,8 @@ python run_carddav.py
 | `TUTA_CALDAV_PORT` | `5232` | CalDAV port |
 | `TUTA_CARDDAV_HOST` | `0.0.0.0` (proxy) / `127.0.0.1` (standalone) | CardDAV bind address |
 | `TUTA_CARDDAV_PORT` | `5233` | CardDAV port |
+| `TUTA_WEBDAV_HOST` | `0.0.0.0` (proxy) / `127.0.0.1` (standalone) | WebDAV bind address |
+| `TUTA_WEBDAV_PORT` | `5234` | WebDAV port |
 | `TUTA_CACHE_PATH` | `tuta_cache.db` | SQLite cache file path |
 | `LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR` |
 | `TUTA_SYS_VERSION` | `150` | Tuta sys model version (override after API update) |
@@ -143,6 +148,8 @@ Use your full Tuta email address as the username and your Tuta password.
 2. Account type: **Manual**, server: `http://localhost:5232/`.
 3. Username: your Tuta email, password: your Tuta password.
 
+See [docs/caldav.md](docs/caldav.md) for more details.
+
 ---
 
 ## CardDAV Setup (contact sync)
@@ -170,6 +177,36 @@ Use your full Tuta email address as the username and your Tuta password.
 2. Account type: **Manual**, server: `http://localhost:5233/`.
 3. Username: your Tuta email, password: your Tuta password.
 
+See [docs/carddav.md](docs/carddav.md) for more details.
+
+---
+
+## WebDAV Setup (Tuta Drive)
+
+The proxy exposes a WebDAV server on port `5234` for Tuta Drive file storage.
+
+See [docs/drive-webdav.md](docs/drive-webdav.md) for full setup instructions (davfs2, rclone, Nautilus, Windows, macOS).
+
+### Quick start with rclone (no root required)
+
+```bash
+rclone config
+# Type: WebDAV
+# URL: http://localhost:5234/
+# Vendor: Other
+# User: your@tuta.com
+# Password: your Tuta password
+
+rclone ls tuta-drive:
+rclone copy /local/path tuta-drive:
+```
+
+### Mount with davfs2 (Linux)
+
+```bash
+sudo mount -t davfs http://localhost:5234/ /mnt/tuta-drive
+```
+
 ---
 
 ## Compatibility
@@ -195,6 +232,9 @@ Any client that supports IMAP4rev1 with AUTH=PLAIN and standard SMTP AUTH should
 - Delete + expunge
 - IDLE (push notifications)
 - Saving drafts (via IMAP APPEND)
+- Calendar sync (CalDAV): read, create, update, delete events; full recurrence support
+- Contact sync (CardDAV): read, create, update, delete contacts; vCard 3.0
+- File storage (WebDAV / Tuta Drive): browse, download, upload, rename, move, delete
 
 ### Known limitations
 
@@ -263,11 +303,20 @@ Nadawca = From, Do = To, Temat = Subject).*
 ## How it works
 
 ```
-Thunderbird ──IMAP/SMTP──▶ tuta-proxy ──HTTPS──▶ app.tuta.com
-              localhost                    TLS + E2E crypto
+Thunderbird / rclone / davfs2
+  │
+  ├── IMAP / SMTP        → localhost:1143 / 1025
+  ├── CalDAV             → localhost:5232
+  ├── CardDAV            → localhost:5233
+  └── WebDAV (Drive)     → localhost:5234
+         │
+    [tuta-proxy]
+         │
+    HTTPS ──────────────▶ app.tuta.com
+    (TLS + E2E crypto)
 ```
 
-The proxy implements Tuta's REST API, including the end-to-end encryption layer (AES-128 session keys, X25519/ECC key exchange, ML-KEM/Kyber post-quantum hybrid for Tuta→Tuta mail).
+The proxy implements Tuta's REST API, including the end-to-end encryption layer (AES-256 session keys, X25519/ECC key exchange, ML-KEM/Kyber post-quantum hybrid for Tuta→Tuta mail). Your private key never leaves your machine.
 
 ---
 
