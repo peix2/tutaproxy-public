@@ -449,7 +449,7 @@ class IMAPConnection:
             self._no(tag, f"Unsupported auth mechanism: {mechanism}")
             return
 
-        # Send empty challenge — client responds with base64(\x00user\x00pass)
+        # Pusty challenge — klient odpowiada base64(\x00user\x00pass)
         self._send("+ ")
         await self.writer.drain()
 
@@ -462,7 +462,7 @@ class IMAPConnection:
         try:
             auth_bytes = base64.b64decode(line.strip())
             parts = auth_bytes.split(b"\x00")
-            # Format: authzid\x00authcid\x00pass  or  authcid\x00pass
+            # Format: authzid\x00authcid\x00pass  lub  authcid\x00pass
             if len(parts) == 3:
                 username, password = parts[1].decode(), parts[2].decode()
             elif len(parts) == 2:
