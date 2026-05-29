@@ -3644,7 +3644,7 @@ class TutaClient:
         else:
             body = {
                 "102": "0",
-                "105": False,
+                "105": "0",   # restore=false — Tuta Boolean serializuje jako "0"/"1"
                 "103": [list(fid) for fid in file_id_tuples],
                 "104": [list(fid) for fid in folder_id_tuples],
             }

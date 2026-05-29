@@ -7,6 +7,16 @@ Versioning: [Semantic Versioning](https://semver.org/) — MAJOR.MINOR.PATCH.
 
 ---
 
+## [1.3.1] — 2026-05-29
+
+### Fixed
+- **WebDAV DELETE returned 502 Bad Gateway** — the `restore` field (field `105`) in the
+  `DriveFolderServiceDeleteIn` request body was sent as a JSON boolean `false` instead of
+  the string `"0"`. Tuta's API serializes Boolean values as `"0"`/`"1"` strings and rejected
+  the raw boolean with an error, causing every DELETE to fail.
+
+---
+
 ## [1.3.0] — 2026-05-29
 
 ### Added
