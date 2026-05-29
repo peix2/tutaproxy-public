@@ -214,7 +214,7 @@ class TutaClient:
                 return await r.json(content_type=None)
             body = await r.text()
             self._check_version_mismatch(r.status, body)
-            raise TutaAPIError(r.status, body)
+            raise _api_error(r.status, body)
 
     async def _get_tutanota(self, url: str, token: str, params: dict = None) -> Any:
         """GET dla endpointów tutanota (v=108)."""
@@ -227,7 +227,7 @@ class TutaClient:
                 return await r.json(content_type=None)
             body = await r.text()
             self._check_version_mismatch(r.status, body)
-            raise TutaAPIError(r.status, body)
+            raise _api_error(r.status, body)
 
     async def _post(self, url: str, body: dict, token: str = "") -> Any:
         headers = {"accessToken": token} if token else {}
@@ -236,7 +236,7 @@ class TutaClient:
                 return await r.json(content_type=None)
             text = await r.text()
             self._check_version_mismatch(r.status, text)
-            raise TutaAPIError(r.status, text)
+            raise _api_error(r.status, text)
 
     async def _delete(self, url: str, token: str) -> None:
         async with self._http.delete(
@@ -245,7 +245,7 @@ class TutaClient:
             if r.status not in (200, 204):
                 body = await r.text()
                 self._check_version_mismatch(r.status, body)
-                raise TutaAPIError(r.status, body)
+                raise _api_error(r.status, body)
 
     # -----------------------------------------------------------------------
     # Login
@@ -734,7 +734,7 @@ class TutaClient:
             headers=headers
         ) as r:
             if r.status not in (200, 201):
-                raise TutaAPIError(r.status, await r.text())
+                raise _api_error(r.status, await r.text())
             token_resp = await r.json(content_type=None)
 
         # Parsuj odpowiedź: 161=[{158:tokenId, 159:blobAccessToken, 160:[{155:serverId,156:url}]}]
@@ -762,7 +762,7 @@ class TutaClient:
             params=params
         ) as r:
             if r.status != 200:
-                raise TutaAPIError(r.status, await r.text())
+                raise _api_error(r.status, await r.text())
             # Odpowiedź to JSON array
             data = await r.json(content_type=None)
 
@@ -951,7 +951,7 @@ class TutaClient:
                     return _json.loads(resp_text)
                 logger.warning(f"_get_blob_token [{label}]: {r.status} body={resp_text!r}")
 
-        raise TutaAPIError(last_status, last_body)
+        raise _api_error(last_status, last_body)
 
     async def get_file_data(self, session: Session, file_obj: dict) -> list[bytes]:
         """
@@ -1017,7 +1017,7 @@ class TutaClient:
                 if r.status != 200:
                     body = await r.text()
                     logger.warning(f"blobservice GET 400: server={server_url} body={body!r}")
-                    raise TutaAPIError(r.status, body)
+                    raise _api_error(r.status, body)
                 raw = await r.read()
 
             # Format odpowiedzi: [count:4B][blobId:9B][hash:6B][size:4B][data:size B]...
@@ -1232,7 +1232,7 @@ class TutaClient:
         ) as r:
             if r.status not in (200, 201, 204):
                 text = await r.text()
-                raise TutaAPIError(r.status, text)
+                raise _api_error(r.status, text)
         logger.debug(f"mark_mails_unread: {len(mail_ids)} mails, unread={unread}")
 
     async def create_folder(
@@ -1272,7 +1272,7 @@ class TutaClient:
             text = await r.text()
             logger.debug(f"create_folder response {r.status}, headers={dict(r.headers)}: '{text[:500]}'")
             if r.status not in (200, 201, 204):
-                raise TutaAPIError(r.status, text)
+                raise _api_error(r.status, text)
             resp = json.loads(text) if text else {}
         # Odpowiedź: {"456":"0","457":[["listId","elementId"]]} — One association wrapped in array
         new_id = resp.get("457", [[]])[0]
@@ -1325,7 +1325,7 @@ class TutaClient:
             text = await r.text()
             if r.status not in (200, 201, 204):
                 logger.warning(f"rename_folder PUT mailset {r.status}: {text[:200]}")
-                raise TutaAPIError(r.status, text)
+                raise _api_error(r.status, text)
         logger.info(f"rename_folder name: '{folder.id}' → '{new_bare_name}'")
 
         # ── 2. Zmiana rodzica: PUT mailfolderservice (UpdateMailFolderData, typ 1311) ──
@@ -1348,7 +1348,7 @@ class TutaClient:
                 text = await r.text()
                 if r.status not in (200, 201, 204):
                     logger.warning(f"rename_folder PUT mailfolderservice {r.status}: {text[:200]}")
-                    raise TutaAPIError(r.status, text)
+                    raise _api_error(r.status, text)
             logger.info(f"rename_folder parent: '{folder.id}' → parent={new_parent.id if new_parent else None}")
 
     async def delete_folder(
@@ -1371,7 +1371,7 @@ class TutaClient:
         ) as r:
             if r.status not in (200, 201, 204):
                 text = await r.text()
-                raise TutaAPIError(r.status, text)
+                raise _api_error(r.status, text)
         logger.info(f"delete_folder: '{folder.id}' deleted")
 
     async def delete_mails(
@@ -1403,7 +1403,7 @@ class TutaClient:
             text = await r.text()
             if r.status not in (200, 201, 204):
                 logger.debug(f"delete_mails: {r.status} response={text!r}")
-                raise TutaAPIError(r.status, text)
+                raise _api_error(r.status, text)
         logger.debug(f"delete_mails: {len(mail_ids)} mails deleted")
 
     async def simple_move_mails(
@@ -1436,7 +1436,7 @@ class TutaClient:
             text = await r.text()
             if r.status not in (200, 201, 204):
                 logger.debug(f"simple_move_mails: {r.status} response={text!r}")
-                raise TutaAPIError(r.status, text)
+                raise _api_error(r.status, text)
         logger.debug(f"simple_move_mails: {len(mail_ids)} mails → type {destination_set_type}")
 
     async def move_mails_to_folder(
@@ -1472,7 +1472,7 @@ class TutaClient:
             text = await r.text()
             if r.status not in (200, 201, 204):
                 logger.debug(f"move_mails_to_folder: {r.status} response={text!r}")
-                raise TutaAPIError(r.status, text)
+                raise _api_error(r.status, text)
         logger.debug(f"move_mails_to_folder: {len(mail_ids)} mails → {target_folder_id}")
 
     async def create_draft(
@@ -1557,7 +1557,7 @@ class TutaClient:
             text = await r.text()
             if r.status not in (200, 201, 204):
                 logger.warning(f"create_draft {r.status}: {text[:400]}")
-                raise TutaAPIError(r.status, text)
+                raise _api_error(r.status, text)
             resp = json.loads(text)
 
         # Odpowiedź: DraftCreateReturn (typ 516), pole 518 = draft (One LIST_ELEMENT) → [[listId, elemId]]
@@ -1754,7 +1754,7 @@ class TutaClient:
             text = await r.text()
             if r.status not in (200, 201, 204):
                 logger.warning(f"ExternalUserService {r.status}: {text[:400]}")
-                raise TutaAPIError(r.status, text)
+                raise _api_error(r.status, text)
         logger.info(f"Secure External: konto utworzone dla {mail_address}")
         return ext_user_group_key, ext_mail_group_key
 
@@ -1847,7 +1847,7 @@ class TutaClient:
             text = await r.text()
             if r.status not in (200, 201, 204):
                 logger.warning(f"send_draft_secure_external {r.status}: {text[:400]}")
-                raise TutaAPIError(r.status, text)
+                raise _api_error(r.status, text)
         logger.info(f"send_draft_secure_external: draft {draft_elem_id} sent → {len(recipients)} odbiorców")
 
     async def send_draft(
@@ -1906,7 +1906,7 @@ class TutaClient:
             text = await r.text()
             if r.status not in (200, 201, 204):
                 logger.warning(f"send_draft {r.status}: {text[:400]}")
-                raise TutaAPIError(r.status, text)
+                raise _api_error(r.status, text)
         logger.info(f"send_draft: draft {draft_elem_id} sent OK")
 
 
@@ -1934,7 +1934,7 @@ class TutaClient:
             if r.status not in (200, 201):
                 resp_text = await r.text()
                 logger.warning(f"_get_blob_write_token {r.status}: {resp_text[:400]}")
-                raise TutaAPIError(r.status, resp_text)
+                raise _api_error(r.status, resp_text)
             resp = await r.json(content_type=None)
 
         access_info = resp.get("161", {})
@@ -1998,7 +1998,7 @@ class TutaClient:
             if r.status not in (200, 201):
                 resp_text = await r.text()
                 logger.warning(f"upload_attachment blob POST {r.status}: {resp_text[:400]}")
-                raise TutaAPIError(r.status, resp_text)
+                raise _api_error(r.status, resp_text)
             blob_resp = await r.json(content_type=None)
 
         # pole 127 = blobReferenceToken (starszy format); 208 = lista wrapperów (nowszy)
@@ -2198,7 +2198,7 @@ class TutaClient:
             text = await r.text()
             if r.status not in (200, 201, 204):
                 logger.warning(f"send_draft_e2e {r.status}: {text[:400]}")
-                raise TutaAPIError(r.status, text)
+                raise _api_error(r.status, text)
         logger.info(f"send_draft_e2e: draft {draft_elem_id} sent E2E → {len(recipients)} odbiorców")
 
 
@@ -2568,7 +2568,7 @@ class TutaClient:
             if r.status not in (200, 201):
                 text = await r.text()
                 logger.error("create_calendar_event_api: HTTP %d headers=%s — %s", r.status, dict(r.headers), text[:500])
-                raise TutaAPIError(r.status, text)
+                raise _api_error(r.status, text)
         logger.info("create_calendar_event_api: %s → [%s, %s]", uid[:16], list_id[:12], elem_id[:12])
         return list_id, elem_id
 
@@ -2584,7 +2584,7 @@ class TutaClient:
         async with self._http.delete(url, headers=headers) as r:
             if r.status not in (200, 204):
                 text = await r.text()
-                raise TutaAPIError(r.status, text)
+                raise _api_error(r.status, text)
         logger.info("delete_calendar_event_api: [%s, %s]", list_id[:12], elem_id[:12])
 
     # -----------------------------------------------------------------------
@@ -2868,7 +2868,7 @@ class TutaClient:
                 text = await r.text()
                 resp_hdrs = dict(r.headers)
                 logger.error("create_contact_api: HTTP %d hdrs=%s — %r", r.status, resp_hdrs, text[:800])
-                raise TutaAPIError(r.status, text)
+                raise _api_error(r.status, text)
             resp = await r.json()
 
         # setupMultiple zwraca listę PersistenceResourcePostReturn:
@@ -2920,7 +2920,7 @@ class TutaClient:
                 text = await r.text()
                 resp_hdrs = dict(r.headers)
                 logger.error("update_contact_api: HTTP %d hdrs=%s — %r", r.status, resp_hdrs, text[:800])
-                raise TutaAPIError(r.status, text)
+                raise _api_error(r.status, text)
         logger.info("update_contact_api: [%s, %s]", contact.list_id[:12], contact.elem_id[:12])
 
     async def delete_contact_api(
@@ -2935,7 +2935,7 @@ class TutaClient:
         async with self._http.delete(url, headers=headers) as r:
             if r.status not in (200, 204):
                 text = await r.text()
-                raise TutaAPIError(r.status, text)
+                raise _api_error(r.status, text)
         logger.info("delete_contact_api: [%s, %s]", list_id[:12], elem_id[:12])
 
     async def delete_contacts_bulk_api(
@@ -2957,7 +2957,7 @@ class TutaClient:
         async with self._http.delete(url, headers=headers, params=params) as r:
             if r.status not in (200, 204):
                 text = await r.text()
-                raise TutaAPIError(r.status, text)
+                raise _api_error(r.status, text)
         logger.info(
             "delete_contacts_bulk_api: [%s] × %d ids",
             list_id[:12], len(elem_ids),
@@ -2975,7 +2975,7 @@ class TutaClient:
                 return await r.json(content_type=None)
             body = await r.text()
             self._check_version_mismatch(r.status, body)
-            raise TutaAPIError(r.status, body)
+            raise _api_error(r.status, body)
 
     async def _post_drive(self, url: str, body: dict, token: str) -> Any:
         """POST dla endpointów drive (v=4)."""
@@ -2986,7 +2986,7 @@ class TutaClient:
                 return json.loads(text) if text.strip() else None
             text = await r.text()
             self._check_version_mismatch(r.status, text)
-            raise TutaAPIError(r.status, text)
+            raise _api_error(r.status, text)
 
     async def _put_drive(self, url: str, body: dict, token: str) -> None:
         """PUT dla endpointów drive (v=4)."""
@@ -2995,7 +2995,7 @@ class TutaClient:
             if r.status not in (200, 204):
                 text = await r.text()
                 self._check_version_mismatch(r.status, text)
-                raise TutaAPIError(r.status, text)
+                raise _api_error(r.status, text)
 
     async def _delete_drive(self, url: str, body: dict, token: str) -> Any:
         """DELETE z ciałem JSON dla endpointów drive (v=4)."""
@@ -3004,7 +3004,7 @@ class TutaClient:
             if r.status not in (200, 204):
                 text = await r.text()
                 self._check_version_mismatch(r.status, text)
-                raise TutaAPIError(r.status, text)
+                raise _api_error(r.status, text)
             if r.status == 200:
                 return await r.json(content_type=None)
             return None
@@ -3281,7 +3281,7 @@ class TutaClient:
         ) as r:
             if r.status not in (200, 201):
                 text = await r.text()
-                raise TutaAPIError(r.status, f"Drive blob token: {text}")
+                raise _api_error(r.status, f"Drive blob token: {text}")
             token_resp = await r.json(content_type=None)
 
         access_info = token_resp.get("161", [{}])[0]
@@ -3321,7 +3321,7 @@ class TutaClient:
             ) as r:
                 if r.status != 200:
                     body = await r.text()
-                    raise TutaAPIError(r.status, f"Drive blob GET: {body}")
+                    raise _api_error(r.status, f"Drive blob GET: {body}")
                 raw_bytes = await r.read()
 
             # Format: [count:4B][blobId:9B][hash:6B][size:4B][data:N B] per blob
@@ -3363,7 +3363,7 @@ class TutaClient:
         ) as r:
             if r.status not in (200, 201):
                 text = await r.text()
-                raise TutaAPIError(r.status, f"Drive write token: {text}")
+                raise _api_error(r.status, f"Drive write token: {text}")
             resp = await r.json(content_type=None)
 
         access_info = resp.get("161", {})
@@ -3469,7 +3469,7 @@ class TutaClient:
                             text = await r.text()
                             logger.error("upload_drive_file_api: chunk %d/%d attempt %d status %d: %s",
                                          idx + 1, len(raw_chunks), attempt + 1, r.status, text[:200])
-                            raise TutaAPIError(r.status, f"Drive blob upload chunk {idx + 1}: {text}")
+                            raise _api_error(r.status, f"Drive blob upload chunk {idx + 1}: {text}")
                         blob_resp = await r.json(content_type=None)
 
                     blob_ref_token = blob_resp.get("127") or ""
@@ -3810,5 +3810,13 @@ class TutaAPIError(Exception):
         self.status_code = status
         super().__init__(f"TutaAPI {status}: {message}")
 
+
 class TutaAuthError(TutaAPIError):
-    pass
+    """401 z Tuty — wydzielona klasa żeby DAV-y mogły mapować na własne 401."""
+
+
+def _api_error(status: int, body: str) -> TutaAPIError:
+    """Factory — przy 401 zwraca TutaAuthError, w pozostałych przypadkach TutaAPIError."""
+    if status == 401:
+        return TutaAuthError(status, body)
+    return TutaAPIError(status, body)

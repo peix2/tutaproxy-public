@@ -7,6 +7,55 @@ Versioning: [Semantic Versioning](https://semver.org/) — MAJOR.MINOR.PATCH.
 
 ---
 
+## [1.3.2] — 2026-05-29
+
+### Security
+
+- **DAV auth bypass — fixed.** `_get_session` in `caldav_server.py`,
+  `carddav_server.py`, and `webdav_server.py` cached the logged-in session keyed
+  by email only. A second request with the same email and any password received
+  the first user's session. The cache now stores `(session, client, sha256(password))`
+  and only returns the cached session when `hmac.compare_digest()` confirms the
+  password hash matches. On mismatch the normal login flow runs and Tuta rejects
+  the wrong password. The previous client is closed before the cache entry is
+  replaced.
+
+- **Default bind 0.0.0.0 → 127.0.0.1.** `run_proxy.py` defaulted to `0.0.0.0`
+  despite the README claiming "binds to 127.0.0.1 by default". Without TLS
+  between the client and the proxy, the Tuta password and full account would be
+  exposed if the proxy were started outside Docker on a host with an open network
+  interface. Defaults are now `127.0.0.1` for all five services. Docker still
+  binds to `0.0.0.0` inside the container (required for port mapping) via
+  `ENV` in the Dockerfile.
+
+- **Dockerfile: missing `TUTA_WEBDAV_HOST` and `EXPOSE 5234`.** WebDAV (added in
+  v1.3.0) was previously reachable from the host only because `run_proxy.py`
+  defaulted to `0.0.0.0`. With the default-bind fix above, the omission in
+  `Dockerfile` surfaced as a regression (mount via davfs failed with
+  "Connection reset"). Both env var and `EXPOSE` are now in place.
+  **Rebuild required:** `docker-compose up -d --build`.
+
+- **HMAC verification in `aes_decrypt_tuta` — warn-only mode.** The function
+  previously discarded the HMAC bytes entirely ("HMAC verification optional"
+  comment). It now computes the expected HMAC over `IV || ciphertext` with the
+  derived HMAC subkey and compares in constant time. On mismatch it logs a
+  `WARNING` (including a non-sensitive 8-char SHA256 fingerprint of the key and
+  the ciphertext length) but continues decryption. This is observability without
+  regression risk on any legacy ciphertext formats. After an observation period
+  with no warnings in production traffic, the function should be promoted to
+  strict mode (raise `ValueError` on mismatch), with an optional kill-switch
+  via `TUTA_SKIP_HMAC=1`.
+
+- **HTTP 401 returns 401 (was 502).** `TutaAuthError` (subclass of
+  `TutaAPIError`) was defined but never raised, so DAV `except TutaAuthError`
+  handlers never fired and wrong passwords fell through to `TutaAPIError`,
+  returning 502 Bad Gateway. A new `_api_error()` factory in `api.py` returns
+  `TutaAuthError` for status 401 and `TutaAPIError` otherwise. All HTTP error
+  raise sites (`_get`, `_get_tutanota`, `_post`, `_delete`, and ~30 inline call
+  sites) now go through this factory.
+
+---
+
 ## [1.3.1] — 2026-05-29
 
 ### Fixed

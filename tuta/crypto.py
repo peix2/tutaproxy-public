@@ -14,6 +14,7 @@ Gdzie bcrypt_salt to 16-bajtowy salt z Tuty zakodowany w formacie bcrypt base64:
 import base64
 import hashlib
 import hmac as _hmac
+import logging
 import os
 from dataclasses import dataclass
 from typing import Optional
@@ -21,6 +22,8 @@ from typing import Optional
 from cryptography.hazmat.primitives import hashes, padding
 from cryptography.hazmat.primitives.asymmetric import padding as asym_padding
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+
+logger = logging.getLogger(__name__)
 
 try:
     import argon2
@@ -362,6 +365,12 @@ def aes_decrypt_tuta(key: bytes, enc_data: bytes) -> bytes:
     Format: [0x01][IV 16B][ciphertext][HMAC-SHA256 32B]
     deriveSubKeys: SHA512(key) → enc_key(32B) + hmac_key(32B)
 
+    Weryfikacja HMAC: tryb warn-only — przy niezgodności loguje WARNING,
+    ale i tak deszyfruje. Pozwala obserwować tampering / niespójność formatu
+    bez ryzyka regresji na legacy danych. Po okresie obserwacji bez warningów
+    najlepszym kolejnym krokiem jest tryb strict z opt-out przez ENV
+    TUTA_SKIP_HMAC=1 — wówczas mismatch będzie rzucał ValueError.
+
     Używane do odszyfrowywania:
       - mail_group_key z membership['27'] (kluczem user_group_key)
       - mail_session_key z mail['102'] (kluczem mail_group_key)
@@ -369,10 +378,28 @@ def aes_decrypt_tuta(key: bytes, enc_data: bytes) -> bytes:
     """
     if enc_data[0] != 0x01:
         raise ValueError(f"Oczekiwano version byte 0x01, dostałem {hex(enc_data[0])}")
+    if len(enc_data) < 49:  # 1 (ver) + 16 (IV) + 32 (HMAC) = 49 minimum
+        raise ValueError(f"Dane za krótkie dla AesCbcThenHmac: {len(enc_data)}B")
     iv = enc_data[1:17]
-    ciphertext = enc_data[17:-32]  # HMAC jest na końcu
-    # HMAC ignorujemy — weryfikacja opcjonalna
-    enc_key = hashlib.sha512(key).digest()[:32]
+    ciphertext = enc_data[17:-32]
+    received_mac = enc_data[-32:]
+
+    derived = hashlib.sha512(key).digest()
+    enc_key = derived[:32]
+    hmac_key = derived[32:]
+
+    # HMAC liczone nad IV + ciphertext (bez version byte — zgodnie z aes_encrypt_tuta).
+    expected_mac = _hmac.new(hmac_key, iv + ciphertext, hashlib.sha256).digest()
+    if not _hmac.compare_digest(expected_mac, received_mac):
+        # warn-only: loguj, ale nie blokuj — chronimy się przed potencjalną regresją
+        # na nietypowych danych z Tuty. Loguje key fingerprint (nie sam klucz) i długość
+        # do diagnostyki, bez ujawniania materiału kryptograficznego.
+        key_fp = hashlib.sha256(key).hexdigest()[:8]
+        logger.warning(
+            "aes_decrypt_tuta: HMAC mismatch — kontynuuję deszyfrowanie "
+            "(warn-only). key_fp=%s len=%d", key_fp, len(enc_data),
+        )
+
     cipher = Cipher(algorithms.AES(enc_key), modes.CBC(iv))
     raw = cipher.decryptor().update(ciphertext) + b""
     # Usuń PKCS7 padding jeśli jest

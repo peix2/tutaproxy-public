@@ -27,6 +27,7 @@ lub przez rclone, GNOME Files (Ctrl+L → dav://localhost:5234/).
 import asyncio
 import base64
 import hashlib
+import hmac
 import logging
 import time
 from dataclasses import dataclass, field
@@ -263,7 +264,10 @@ class WebDAVServer:
     def __init__(self, host: str = "127.0.0.1", port: int = 5234):
         self.host = host
         self.port = port
-        self._sessions: dict[str, tuple] = {}   # email → (session, client)
+        # email → (session, client, pw_hash) — pw_hash chroni przed auth bypass:
+        # bez tego drugi request z tym samym emailem i innym hasłem dostawałby
+        # zalogowaną sesję pierwszego (krytyczna luka przy bind != 127.0.0.1).
+        self._sessions: dict[str, tuple] = {}
         self._login_locks: dict[str, asyncio.Lock] = {}
         self._drive_cache: dict[str, _DriveCache] = {}
         self._cache_lock = asyncio.Lock()
@@ -281,14 +285,17 @@ class WebDAVServer:
     # -----------------------------------------------------------------------
 
     async def _get_session(self, username: str, password: str):
-        """Loguje raz i cachuje (session, client) per email."""
-        if username in self._sessions:
-            return self._sessions[username]
+        """Cache trafia tylko gdy sha256(password) się zgadza — bez tego auth bypass."""
+        pw_hash = hashlib.sha256(password.encode("utf-8")).digest()
+        cached = self._sessions.get(username)
+        if cached and len(cached) >= 3 and hmac.compare_digest(cached[2], pw_hash):
+            return cached[0], cached[1]
         if username not in self._login_locks:
             self._login_locks[username] = asyncio.Lock()
         async with self._login_locks[username]:
-            if username in self._sessions:
-                return self._sessions[username]
+            cached = self._sessions.get(username)
+            if cached and len(cached) >= 3 and hmac.compare_digest(cached[2], pw_hash):
+                return cached[0], cached[1]
             client = TutaClient()
             await client.__aenter__()
             try:
@@ -296,7 +303,13 @@ class WebDAVServer:
             except Exception:
                 await client.__aexit__(None, None, None)
                 raise
-            self._sessions[username] = (session, client)
+            old = self._sessions.get(username)
+            if old:
+                try:
+                    await old[1].__aexit__(None, None, None)
+                except Exception as exc:
+                    logger.debug("WebDAV: błąd zamykania starego klienta dla %s: %s", username, exc)
+            self._sessions[username] = (session, client, pw_hash)
             logger.info("WebDAV: zalogowano %s", username)
             return session, client
 

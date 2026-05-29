@@ -3,15 +3,15 @@ run_proxy.py
 Uruchamia IMAP i SMTP proxy jednocześnie w jednej pętli asyncio.
 
 Zmienne środowiskowe:
-    TUTA_IMAP_HOST      — domyślnie 0.0.0.0
+    TUTA_IMAP_HOST      — domyślnie 127.0.0.1 (Docker nadpisuje na 0.0.0.0)
     TUTA_IMAP_PORT      — domyślnie 1143
-    TUTA_SMTP_HOST      — domyślnie 0.0.0.0
+    TUTA_SMTP_HOST      — domyślnie 127.0.0.1
     TUTA_SMTP_PORT      — domyślnie 1025
-    TUTA_CALDAV_HOST    — domyślnie 0.0.0.0
+    TUTA_CALDAV_HOST    — domyślnie 127.0.0.1
     TUTA_CALDAV_PORT    — domyślnie 5232
-    TUTA_CARDDAV_HOST   — domyślnie 0.0.0.0
+    TUTA_CARDDAV_HOST   — domyślnie 127.0.0.1
     TUTA_CARDDAV_PORT   — domyślnie 5233
-    TUTA_WEBDAV_HOST    — domyślnie 0.0.0.0
+    TUTA_WEBDAV_HOST    — domyślnie 127.0.0.1
     TUTA_WEBDAV_PORT    — domyślnie 5234
     TUTA_CACHE_PATH     — domyślnie /data/tuta_cache.db
     LOG_LEVEL           — domyślnie INFO
@@ -66,15 +66,18 @@ from tuta.webdav_server import WebDAVServer
 
 
 async def main() -> None:
-    imap_host    = os.environ.get("TUTA_IMAP_HOST",    "0.0.0.0")
+    # Defaulty 127.0.0.1 — bez TLS-a między klientem a proxy hasło Tuty
+    # i całe konto byłyby narażone przy bind na 0.0.0.0. Docker nadpisuje
+    # przez ENV w Dockerfile (gdzie 0.0.0.0 jest konieczne dla port mappingu).
+    imap_host    = os.environ.get("TUTA_IMAP_HOST",    "127.0.0.1")
     imap_port    = int(os.environ.get("TUTA_IMAP_PORT",    "1143"))
-    smtp_host    = os.environ.get("TUTA_SMTP_HOST",    "0.0.0.0")
+    smtp_host    = os.environ.get("TUTA_SMTP_HOST",    "127.0.0.1")
     smtp_port    = int(os.environ.get("TUTA_SMTP_PORT",    "1025"))
-    caldav_host  = os.environ.get("TUTA_CALDAV_HOST",  "0.0.0.0")
+    caldav_host  = os.environ.get("TUTA_CALDAV_HOST",  "127.0.0.1")
     caldav_port  = int(os.environ.get("TUTA_CALDAV_PORT",  "5232"))
-    carddav_host = os.environ.get("TUTA_CARDDAV_HOST", "0.0.0.0")
+    carddav_host = os.environ.get("TUTA_CARDDAV_HOST", "127.0.0.1")
     carddav_port = int(os.environ.get("TUTA_CARDDAV_PORT", "5233"))
-    webdav_host  = os.environ.get("TUTA_WEBDAV_HOST",  "0.0.0.0")
+    webdav_host  = os.environ.get("TUTA_WEBDAV_HOST",  "127.0.0.1")
     webdav_port  = int(os.environ.get("TUTA_WEBDAV_PORT",  "5234"))
     cache_path   = os.environ.get("TUTA_CACHE_PATH",   "/data/tuta_cache.db")
 

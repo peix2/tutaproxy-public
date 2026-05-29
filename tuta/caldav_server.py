@@ -18,6 +18,7 @@ Zapis:
 import asyncio
 import base64
 import hashlib
+import hmac
 import logging
 import re
 import time
@@ -739,7 +740,10 @@ class CalDAVServer:
     def __init__(self, host: str = "127.0.0.1", port: int = 5232):
         self.host = host
         self.port = port
-        self._sessions: dict[str, tuple[Session, TutaClient]] = {}
+        # email → (session, client, pw_hash) — pw_hash chroni przed auth bypass:
+        # bez tego drugi request z tym samym emailem i innym hasłem dostawałby
+        # zalogowaną sesję pierwszego (krytyczna luka, szczególnie przy bind != 127.0.0.1).
+        self._sessions: dict[str, tuple[Session, TutaClient, bytes]] = {}
         self._event_cache: dict[str, tuple[float, list[CalendarEvent]]] = {}
         self._cache_ttl = 60   # krótki TTL żeby eventy z Tuty pojawiały się w TB po ~1 min
         # (group_id, group_key, short_list_id, long_list_id, key_version) — bez TTL
@@ -855,15 +859,20 @@ class CalDAVServer:
         )
 
     async def _get_session(self, email: str, password: str) -> tuple[Session, TutaClient]:
-        # Szybka ścieżka — sesja już istnieje
-        if email in self._sessions:
-            return self._sessions[email]
+        # Weryfikacja hasła przy każdym wejściu — porównujemy sha256(password)
+        # w czasie stałym. Bez tego cache po pierwszym poprawnym logowaniu zwracał
+        # sesję dla dowolnego hasła (auth bypass).
+        pw_hash = hashlib.sha256(password.encode("utf-8")).digest()
+        cached = self._sessions.get(email)
+        if cached and hmac.compare_digest(cached[2], pw_hash):
+            return cached[0], cached[1]
         # Blokada per-email: drugi równoległy request czeka zamiast tworzyć drugiego klienta
         if email not in self._login_locks:
             self._login_locks[email] = asyncio.Lock()
         async with self._login_locks[email]:
-            if email in self._sessions:       # mógł zostać dodany gdy czekaliśmy na lock
-                return self._sessions[email]
+            cached = self._sessions.get(email)
+            if cached and hmac.compare_digest(cached[2], pw_hash):
+                return cached[0], cached[1]
             client = TutaClient()
             await client.__aenter__()
             try:
@@ -871,7 +880,14 @@ class CalDAVServer:
             except Exception:
                 await client.__aexit__(None, None, None)
                 raise
-            self._sessions[email] = (session, client)
+            # Zamknij starą sesję (inne hasło) zanim podmienimy
+            old = self._sessions.get(email)
+            if old:
+                try:
+                    await old[1].__aexit__(None, None, None)
+                except Exception as exc:
+                    logger.debug("CalDAV: błąd zamykania starego klienta dla %s: %s", email, exc)
+            self._sessions[email] = (session, client, pw_hash)
             logger.info("CalDAV: zalogowano %s", email)
             return session, client
 

@@ -24,6 +24,7 @@ Cache: kontakty trzymane w pamięci przez CACHE_TTL sekund.
 import asyncio
 import base64
 import hashlib
+import hmac
 import logging
 import re
 import time
@@ -404,7 +405,9 @@ class CardDAVServer:
     def __init__(self, host: str = "127.0.0.1", port: int = 5233):
         self.host = host
         self.port = port
-        # (session, client) per email — client żyje przez całą sesję serwera
+        # (session, client, pw_hash) per email — pw_hash chroni przed auth bypass:
+        # bez tego drugi request z tym samym emailem i innym hasłem dostawałby
+        # zalogowaną sesję pierwszego (krytyczna luka przy bind != 127.0.0.1).
         self._sessions: dict[str, tuple] = {}
         self._login_locks: dict[str, asyncio.Lock] = {}
         self._cache: dict[str, _CacheEntry] = {}
@@ -423,14 +426,17 @@ class CardDAVServer:
             await server.serve_forever()
 
     async def _get_session(self, username: str, password: str):
-        """Zwraca (session, client) — loguje raz, potem cachuje."""
-        if username in self._sessions:
-            return self._sessions[username]
+        """Zwraca (session, client) — cache trafia tylko gdy sha256(password) się zgadza."""
+        pw_hash = hashlib.sha256(password.encode("utf-8")).digest()
+        cached = self._sessions.get(username)
+        if cached and len(cached) >= 3 and hmac.compare_digest(cached[2], pw_hash):
+            return cached[0], cached[1]
         if username not in self._login_locks:
             self._login_locks[username] = asyncio.Lock()
         async with self._login_locks[username]:
-            if username in self._sessions:
-                return self._sessions[username]
+            cached = self._sessions.get(username)
+            if cached and len(cached) >= 3 and hmac.compare_digest(cached[2], pw_hash):
+                return cached[0], cached[1]
             client = TutaClient()
             await client.__aenter__()
             try:
@@ -438,7 +444,13 @@ class CardDAVServer:
             except Exception:
                 await client.__aexit__(None, None, None)
                 raise
-            self._sessions[username] = (session, client)
+            old = self._sessions.get(username)
+            if old:
+                try:
+                    await old[1].__aexit__(None, None, None)
+                except Exception as exc:
+                    logger.debug("CardDAV: błąd zamykania starego klienta dla %s: %s", username, exc)
+            self._sessions[username] = (session, client, pw_hash)
             logger.info("CardDAV: zalogowano %s", username)
             return session, client
 

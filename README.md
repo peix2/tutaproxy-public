@@ -81,15 +81,15 @@ python run_webdav.py
 
 | Variable | Default | Description |
 |---|---|---|
-| `TUTA_IMAP_HOST` | `0.0.0.0` (proxy) / `127.0.0.1` (standalone) | IMAP bind address |
+| `TUTA_IMAP_HOST` | `127.0.0.1` (Docker overrides to `0.0.0.0`) | IMAP bind address |
 | `TUTA_IMAP_PORT` | `1143` | IMAP port |
-| `TUTA_SMTP_HOST` | `0.0.0.0` (proxy) / `127.0.0.1` (standalone) | SMTP bind address |
+| `TUTA_SMTP_HOST` | `127.0.0.1` (Docker overrides to `0.0.0.0`) | SMTP bind address |
 | `TUTA_SMTP_PORT` | `1025` | SMTP port |
-| `TUTA_CALDAV_HOST` | `0.0.0.0` (proxy) / `127.0.0.1` (standalone) | CalDAV bind address |
+| `TUTA_CALDAV_HOST` | `127.0.0.1` (Docker overrides to `0.0.0.0`) | CalDAV bind address |
 | `TUTA_CALDAV_PORT` | `5232` | CalDAV port |
-| `TUTA_CARDDAV_HOST` | `0.0.0.0` (proxy) / `127.0.0.1` (standalone) | CardDAV bind address |
+| `TUTA_CARDDAV_HOST` | `127.0.0.1` (Docker overrides to `0.0.0.0`) | CardDAV bind address |
 | `TUTA_CARDDAV_PORT` | `5233` | CardDAV port |
-| `TUTA_WEBDAV_HOST` | `0.0.0.0` (proxy) / `127.0.0.1` (standalone) | WebDAV bind address |
+| `TUTA_WEBDAV_HOST` | `127.0.0.1` (Docker overrides to `0.0.0.0`) | WebDAV bind address |
 | `TUTA_WEBDAV_PORT` | `5234` | WebDAV port |
 | `TUTA_CACHE_PATH` | `tuta_cache.db` | SQLite cache file path |
 | `LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR` |
@@ -296,7 +296,9 @@ Nadawca = From, Do = To, Temat = Subject).*
 
 - The proxy binds to `127.0.0.1` by default (Docker: `0.0.0.0` inside the container, but ports are mapped to `127.0.0.1` on the host).
 - Your Tuta password is passed through by your email client for each session. It is used to authenticate against Tuta's API and is not written to disk.
+- For each CalDAV/CardDAV/WebDAV request the proxy compares `sha256(password)` against the cached session hash in constant time; a cached session is reused only when the hash matches.
 - All actual email data is fetched from Tuta's servers over HTTPS. Decryption happens in the proxy process on your machine.
+- The proxy verifies the HMAC tag on Tuta's AesCbcThenHmac ciphertexts. As of v1.3.2 this is **warn-only**: a mismatch logs a warning (with a short non-sensitive key fingerprint) but decryption proceeds. Strict mode (raise on mismatch, with a `TUTA_SKIP_HMAC=1` kill-switch) is planned after an observation period.
 
 ---
 
