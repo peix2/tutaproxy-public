@@ -740,6 +740,7 @@ class CalDAVServer:
     def __init__(self, host: str = "127.0.0.1", port: int = 5232):
         self.host = host
         self.port = port
+        self._server: Optional[asyncio.AbstractServer] = None
         # email → (session, client, pw_hash) — pw_hash chroni przed auth bypass:
         # bez tego drugi request z tym samym emailem i innym hasłem dostawałby
         # zalogowaną sesję pierwszego (krytyczna luka, szczególnie przy bind != 127.0.0.1).
@@ -763,6 +764,22 @@ class CalDAVServer:
         )
         logger.info("CalDAV server nasłuchuje na %s:%d", self.host, self.port)
 
+    async def stop(self) -> None:
+        """Graceful shutdown: zamknij TCP listener, wyloguj wszystkich zalogowanych
+        userów (DELETE /sys/session w Tucie), zamknij klientów aiohttp."""
+        if self._server:
+            self._server.close()
+            try:
+                await self._server.wait_closed()
+            except Exception as exc:
+                logger.debug("CalDAV: wait_closed: %s", exc)
+        if self._sessions:
+            logger.info("CalDAV: graceful logout %d sesji", len(self._sessions))
+            for email, cached in list(self._sessions.items()):
+                await self._close_cached_session(email, cached, do_logout=True)
+            self._sessions.clear()
+        logger.info("CalDAV: shutdown OK")
+
     async def _handle_conn(self, reader: asyncio.StreamReader,
                            writer: asyncio.StreamWriter) -> None:
         peer = writer.get_extra_info("peername", ("?", 0))
@@ -770,7 +787,7 @@ class CalDAVServer:
             req = await self._read_request(reader)
             if req is None:
                 return
-            resp = await self._dispatch(req)
+            resp = await self._dispatch_with_relogin(req)
         except asyncio.TimeoutError:
             resp = HttpResponse(408, "Request Timeout")
         except Exception as e:
@@ -883,13 +900,48 @@ class CalDAVServer:
             # Zamknij starą sesję (inne hasło) zanim podmienimy
             old = self._sessions.get(email)
             if old:
-                try:
-                    await old[1].__aexit__(None, None, None)
-                except Exception as exc:
-                    logger.debug("CalDAV: błąd zamykania starego klienta dla %s: %s", email, exc)
+                await self._close_cached_session(email, old, do_logout=True)
             self._sessions[email] = (session, client, pw_hash)
+            self._event_cache.pop(email, None)
             logger.info("CalDAV: zalogowano %s", email)
             return session, client
+
+    async def _close_cached_session(self, email: str, cached: tuple, do_logout: bool) -> None:
+        """Zamyka klienta z cache. do_logout=True → najpierw DELETE /sys/session
+        w Tucie (graceful shutdown); False → tylko close aiohttp."""
+        session, client, _ = cached
+        if do_logout:
+            try:
+                await client.logout(session)
+            except Exception as exc:
+                logger.debug("CalDAV: logout %s zignorowany: %s", email, exc)
+        try:
+            await client.__aexit__(None, None, None)
+        except Exception as exc:
+            logger.debug("CalDAV: close klienta %s zignorowany: %s", email, exc)
+
+    async def _invalidate_session(self, email: str) -> None:
+        """Usuwa sesję z cache (po 440 SessionExpired). Robi best-effort logout —
+        access token jest już nieważny, ale DELETE i tak nie zaszkodzi."""
+        old = self._sessions.pop(email, None)
+        self._event_cache.pop(email, None)
+        self._cal_info.pop(email, None)
+        if old:
+            await self._close_cached_session(email, old, do_logout=False)
+
+    async def _dispatch_with_relogin(self, req: HttpRequest) -> HttpResponse:
+        """Wokół _dispatch — przy 440 SessionExpired wywala sesję z cache i ponawia
+        raz. Nowy _get_session zaloguje świeżą sesję z hasłem z Basic auth."""
+        try:
+            return await self._dispatch(req)
+        except TutaAPIError as e:
+            if e.status_code == 440:
+                creds = self._parse_auth(req)
+                if creds:
+                    logger.info("CalDAV: 440 SessionExpired dla %s, invalidate + retry", creds[0])
+                    await self._invalidate_session(creds[0])
+                    return await self._dispatch(req)
+            raise
 
     async def _get_events(self, email: str, session: Session,
                           client: TutaClient) -> list[CalendarEvent]:
@@ -1048,6 +1100,10 @@ class CalDAVServer:
             session, client = await self._get_session(email, password)
             events = await self._get_events(email, session, client)
         except TutaAPIError as e:
+            # 440 = SessionExpiredError — propaguj do _dispatch_with_relogin,
+            # który wywali cache i ponowi cały request ze świeżą sesją.
+            if e.status_code == 440:
+                raise
             if e.status_code == 401:
                 return self._unauthorized()
             return _text_resp(502, "Bad Gateway", str(e))
@@ -1094,6 +1150,10 @@ class CalDAVServer:
             session, client = await self._get_session(email, password)
             events = await self._get_events(email, session, client)
         except TutaAPIError as e:
+            # 440 = SessionExpiredError — propaguj do _dispatch_with_relogin,
+            # który wywali cache i ponowi cały request ze świeżą sesją.
+            if e.status_code == 440:
+                raise
             if e.status_code == 401:
                 return self._unauthorized()
             return _text_resp(502, "Bad Gateway", str(e))
@@ -1171,6 +1231,10 @@ class CalDAVServer:
                 await self._get_cal_info(email, session, client)
             events = await self._get_events(email, session, client)
         except TutaAPIError as e:
+            # 440 = SessionExpiredError — propaguj do _dispatch_with_relogin,
+            # który wywali cache i ponowi cały request ze świeżą sesją.
+            if e.status_code == 440:
+                raise
             if e.status_code == 401:
                 return self._unauthorized()
             return _text_resp(502, "Bad Gateway", str(e))
@@ -1291,6 +1355,8 @@ class CalDAVServer:
                     session, group_key, group_id, short_list_id, long_list_id, ev, key_version
                 )
             except TutaAPIError as e:
+                if e.status_code == 440:
+                    raise  # propagate do _dispatch_with_relogin
                 logger.error("CalDAV PUT: błąd API HTTP %s: %s", e.status_code, str(e)[:500])
                 return _text_resp(502, "Bad Gateway", str(e))
             except Exception as e:
@@ -1327,6 +1393,10 @@ class CalDAVServer:
             session, client = await self._get_session(email, password)
             events = await self._get_events(email, session, client)
         except TutaAPIError as e:
+            # 440 = SessionExpiredError — propaguj do _dispatch_with_relogin,
+            # który wywali cache i ponowi cały request ze świeżą sesją.
+            if e.status_code == 440:
+                raise
             if e.status_code == 401:
                 return self._unauthorized()
             return _text_resp(502, "Bad Gateway", str(e))

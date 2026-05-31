@@ -143,6 +143,7 @@ class _TutaSMTPHandler:
             f"attachments={len(mime_attachments)} secure_external={secure_password is not None}"
         )
 
+        tuta_session = None
         try:
             tuta_session = await self.client.login(email_addr, password)
             mail_group_key = await self.client.get_mail_group_key(tuta_session)
@@ -260,6 +261,14 @@ class _TutaSMTPHandler:
         except Exception as e:
             logger.exception(f"SMTP unexpected error: {e}")
             return "451 4.0.0 Internal error"
+        finally:
+            # SMTP loguje świeżą sesję per request — natychmiastowy logout zapobiega
+            # akumulacji "active sessions" w UI Tuty (token TTL to wiele godzin).
+            if tuta_session is not None:
+                try:
+                    await self.client.logout(tuta_session)
+                except Exception as exc:
+                    logger.debug("SMTP: logout zignorowany: %s", exc)
 
         return "250 2.0.0 OK: Message accepted"
 
@@ -310,8 +319,15 @@ class SMTPServer:
         await self._server.serve_forever()
 
     async def stop(self):
+        """Graceful shutdown — listener jest zamykany, klient aiohttp też.
+        SMTP nie trzyma cache sesji (logout per request w handle_DATA), więc
+        nie ma osobnych sesji do wylogowania tutaj."""
         if self._server:
             self._server.close()
-            await self._server.wait_closed()
+            try:
+                await self._server.wait_closed()
+            except Exception as exc:
+                logger.debug("SMTP: wait_closed: %s", exc)
         if self._client:
             await self._client.__aexit__(None, None, None)
+        logger.info("SMTP: shutdown OK")

@@ -21,6 +21,7 @@ Zmienne środowiskowe:
 import asyncio
 import logging
 import os
+import signal
 import sys
 
 sys.path.insert(0, ".")
@@ -93,20 +94,62 @@ async def main() -> None:
     print(f"tuta-proxy CardDAV {carddav_host}:{carddav_port}")
     print(f"tuta-proxy WebDAV  {webdav_host}:{webdav_port}  (Tuta Drive)")
     print(f"cache: {cache_path}")
-    print("Zatrzymaj: Ctrl+C")
+    print("Zatrzymaj: Ctrl+C (lub SIGTERM)")
+
+    # SIGTERM (docker stop) i SIGINT (Ctrl+C) anulują główny gather.
+    # Bez SIGTERM handlera docker stop tylko zabija proces po 10s timeout —
+    # graceful logout sesji w Tucie się nigdy nie wykona i sesje akumulują
+    # się w UI Tuty.
+    loop = asyncio.get_running_loop()
+    stop_event = asyncio.Event()
+
+    def _request_stop(sig_name: str) -> None:
+        if not stop_event.is_set():
+            print(f"\n{sig_name} — graceful shutdown...", flush=True)
+            stop_event.set()
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, _request_stop, sig.name)
+        except NotImplementedError:
+            # Windows nie wspiera add_signal_handler — fallback do KeyboardInterrupt
+            pass
+
+    servers = [imap, smtp, caldav, carddav, webdav]
+    serve_task = asyncio.gather(*(s.start() for s in servers), return_exceptions=True)
+    stop_task = asyncio.create_task(stop_event.wait())
 
     try:
-        await asyncio.gather(
-            imap.start(), smtp.start(), caldav.start(), carddav.start(), webdav.start()
+        done, pending = await asyncio.wait(
+            {serve_task, stop_task}, return_when=asyncio.FIRST_COMPLETED
         )
-    except asyncio.CancelledError:
-        pass
     finally:
-        await asyncio.gather(imap.stop(), smtp.stop(), return_exceptions=True)
+        # Anuluj główne serve_task; każdy serv.start() w nim się rozpiąć (CancelledError)
+        # lub zakończy bo .stop() zamknie listener.
+        for t in (serve_task, stop_task):
+            if not t.done():
+                t.cancel()
+        # Graceful shutdown z timeoutem — DELETE /sys/session per użytkownik
+        # może trwać; ale nie chcemy wisieć w nieskończoność.
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*(s.stop() for s in servers), return_exceptions=True),
+                timeout=15,
+            )
+        except asyncio.TimeoutError:
+            print("Graceful shutdown timeout (15s) — wymuszam zamknięcie.", flush=True)
+        # Spokojnie odczekaj na anulowane taski
+        for t in (serve_task, stop_task):
+            try:
+                await t
+            except (asyncio.CancelledError, Exception):
+                pass
+        print("Zatrzymano.", flush=True)
 
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\nZatrzymano.")
+        # Fallback gdy add_signal_handler niedostępne (np. Windows)
+        print("\nZatrzymano (KeyboardInterrupt).")

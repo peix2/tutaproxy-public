@@ -264,6 +264,7 @@ class WebDAVServer:
     def __init__(self, host: str = "127.0.0.1", port: int = 5234):
         self.host = host
         self.port = port
+        self._server: Optional[asyncio.AbstractServer] = None
         # email → (session, client, pw_hash) — pw_hash chroni przed auth bypass:
         # bez tego drugi request z tym samym emailem i innym hasłem dostawałby
         # zalogowaną sesję pierwszego (krytyczna luka przy bind != 127.0.0.1).
@@ -275,10 +276,28 @@ class WebDAVServer:
         self._upload_locks: dict[str, asyncio.Lock] = {}
 
     async def start(self) -> None:
-        server = await asyncio.start_server(self._handle_conn, self.host, self.port)
+        self._server = await asyncio.start_server(self._handle_conn, self.host, self.port)
         logger.info("WebDAV (Tuta Drive): http://%s:%d/", self.host, self.port)
-        async with server:
-            await server.serve_forever()
+        async with self._server:
+            try:
+                await self._server.serve_forever()
+            except asyncio.CancelledError:
+                pass
+
+    async def stop(self) -> None:
+        """Graceful shutdown: zamknij TCP listener, wyloguj wszystkie sesje, zamknij klientów."""
+        if self._server:
+            self._server.close()
+            try:
+                await self._server.wait_closed()
+            except Exception as exc:
+                logger.debug("WebDAV: wait_closed: %s", exc)
+        if self._sessions:
+            logger.info("WebDAV: graceful logout %d sesji", len(self._sessions))
+            for username, cached in list(self._sessions.items()):
+                await self._close_cached_session(username, cached, do_logout=True)
+            self._sessions.clear()
+        logger.info("WebDAV: shutdown OK")
 
     # -----------------------------------------------------------------------
     # Autentykacja i sesja
@@ -305,13 +324,53 @@ class WebDAVServer:
                 raise
             old = self._sessions.get(username)
             if old:
-                try:
-                    await old[1].__aexit__(None, None, None)
-                except Exception as exc:
-                    logger.debug("WebDAV: błąd zamykania starego klienta dla %s: %s", username, exc)
+                await self._close_cached_session(username, old, do_logout=True)
             self._sessions[username] = (session, client, pw_hash)
+            self._drive_cache.pop(session.user_email, None)
             logger.info("WebDAV: zalogowano %s", username)
             return session, client
+
+    async def _close_cached_session(self, username: str, cached: tuple, do_logout: bool) -> None:
+        """Zamyka klienta z cache. do_logout=True → najpierw DELETE /sys/session;
+        False → tylko close aiohttp (np. po 440 — token i tak nieważny)."""
+        session, client, _ = cached
+        if do_logout:
+            try:
+                await client.logout(session)
+            except Exception as exc:
+                logger.debug("WebDAV: logout %s zignorowany: %s", username, exc)
+        try:
+            await client.__aexit__(None, None, None)
+        except Exception as exc:
+            logger.debug("WebDAV: close klienta %s zignorowany: %s", username, exc)
+
+    async def _invalidate_session(self, username: str) -> None:
+        """Usuwa sesję z cache (po 440 SessionExpired)."""
+        old = self._sessions.pop(username, None)
+        if old:
+            try:
+                self._drive_cache.pop(old[0].user_email, None)
+            except Exception:
+                pass
+            await self._close_cached_session(username, old, do_logout=False)
+
+    async def _dispatch_with_relogin(self, req: "HTTPRequest") -> "HTTPResponse":
+        """Wokół _dispatch — przy 440 SessionExpired wywala sesję z cache i ponawia raz."""
+        try:
+            return await self._dispatch(req)
+        except TutaAPIError as e:
+            if e.status_code == 440:
+                auth = req.header("authorization")
+                if auth and auth.lower().startswith("basic "):
+                    try:
+                        decoded = base64.b64decode(auth[6:]).decode("utf-8")
+                        username = decoded.split(":", 1)[0]
+                        logger.info("WebDAV: 440 SessionExpired dla %s, invalidate + retry", username)
+                        await self._invalidate_session(username)
+                        return await self._dispatch(req)
+                    except Exception:
+                        pass
+            raise
 
     async def _get_drive_cache(
         self, session, client: TutaClient
@@ -431,7 +490,7 @@ class WebDAVServer:
                 writer.close()
                 return
             logger.info("WebDAV %s %s [%s:%d]", req.method, req.path, peer[0], peer[1])
-            resp = await self._dispatch(req)
+            resp = await self._dispatch_with_relogin(req)
             logger.info("WebDAV → %d %s", resp.status, resp.reason)
             writer.write(resp.to_bytes())
             await writer.drain()
@@ -496,6 +555,8 @@ class WebDAVServer:
                 "WWW-Authenticate": 'Basic realm="Tuta Drive"',
             })
         except TutaAPIError as e:
+            if e.status_code == 440:
+                raise  # _dispatch_with_relogin invaliduje cache i ponowi request
             if "groupType=7" in str(e) or "Drive" in str(e):
                 return _simple_resp(503, "Service Unavailable", str(e))
             return _simple_resp(502, "Bad Gateway", str(e))
@@ -503,6 +564,8 @@ class WebDAVServer:
         try:
             dc = await self._get_drive_cache(session, client)
         except TutaAPIError as e:
+            if e.status_code == 440:
+                raise
             return _simple_resp(503, "Service Unavailable", f"Drive niedostępny: {e}")
 
         method = req.method
@@ -638,6 +701,8 @@ class WebDAVServer:
         try:
             data = await client.download_drive_file_data(session, dc.group_key, f)
         except TutaAPIError as e:
+            if e.status_code == 440:
+                raise
             return _simple_resp(502, "Bad Gateway", f"Błąd pobierania: {e}")
 
         return _bytes_resp(200, "OK", data, f.mime_type or "application/octet-stream", {
@@ -700,6 +765,8 @@ class WebDAVServer:
                     session, [old_file.id_tuple], [], permanent=False
                 )
             except TutaAPIError as e:
+                if e.status_code == 440:
+                    raise
                 logger.warning("PUT: nie można usunąć starego pliku: %s", e)
 
         mime = req.header("content-type") or "application/octet-stream"
@@ -718,6 +785,8 @@ class WebDAVServer:
                 parent_folder.id_tuple,
             )
         except TutaAPIError as e:
+            if e.status_code == 440:
+                raise
             logger.error("PUT %s failed: %s", filename, e)
             return _simple_resp(502, "Bad Gateway", f"Upload error: {e}")
 
@@ -761,6 +830,8 @@ class WebDAVServer:
                 folder: DriveFolder = obj
                 await client.delete_drive_items_api(session, [], [folder.id_tuple], permanent=False)
         except TutaAPIError as e:
+            if e.status_code == 440:
+                raise
             return _simple_resp(502, "Bad Gateway", f"Delete error: {e}")
 
         # Unieważnij cache folderu nadrzędnego
@@ -804,6 +875,8 @@ class WebDAVServer:
                 session, dc.group_key, dc.key_version, dirname, parent_folder.id_tuple
             )
         except TutaAPIError as e:
+            if e.status_code == 440:
+                raise
             return _simple_resp(502, "Bad Gateway", f"MKCOL error: {e}")
 
         dc.invalidate_folder(parent_folder.id_tuple)
@@ -859,6 +932,8 @@ class WebDAVServer:
                     else:
                         await client.delete_drive_items_api(session, [], [dest_obj.id_tuple], permanent=False)
                 except TutaAPIError as e:
+                    if e.status_code == 440:
+                        raise
                     logger.warning("MOVE: usunięcie celu nieudane: %s", e)
 
         try:
@@ -885,6 +960,8 @@ class WebDAVServer:
                         session, dc.group_key, [], [obj], dest_parent_folder.id_tuple, rename_map
                     )
         except TutaAPIError as e:
+            if e.status_code == 440:
+                raise
             return _simple_resp(502, "Bad Gateway", f"MOVE error: {e}")
 
         # Unieważnij cache obu folderów

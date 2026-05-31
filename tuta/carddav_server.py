@@ -405,6 +405,7 @@ class CardDAVServer:
     def __init__(self, host: str = "127.0.0.1", port: int = 5233):
         self.host = host
         self.port = port
+        self._server: Optional[asyncio.AbstractServer] = None
         # (session, client, pw_hash) per email — pw_hash chroni przed auth bypass:
         # bez tego drugi request z tym samym emailem i innym hasłem dostawałby
         # zalogowaną sesję pierwszego (krytyczna luka przy bind != 127.0.0.1).
@@ -420,10 +421,28 @@ class CardDAVServer:
         self._delete_locks: dict[str, asyncio.Lock] = {}
 
     async def start(self) -> None:
-        server = await asyncio.start_server(self._handle_conn, self.host, self.port)
+        self._server = await asyncio.start_server(self._handle_conn, self.host, self.port)
         logger.info("CardDAV server: http://%s:%d/", self.host, self.port)
-        async with server:
-            await server.serve_forever()
+        async with self._server:
+            try:
+                await self._server.serve_forever()
+            except asyncio.CancelledError:
+                pass
+
+    async def stop(self) -> None:
+        """Graceful shutdown: zamknij TCP listener, wyloguj wszystkie sesje, zamknij klientów."""
+        if self._server:
+            self._server.close()
+            try:
+                await self._server.wait_closed()
+            except Exception as exc:
+                logger.debug("CardDAV: wait_closed: %s", exc)
+        if self._sessions:
+            logger.info("CardDAV: graceful logout %d sesji", len(self._sessions))
+            for username, cached in list(self._sessions.items()):
+                await self._close_cached_session(username, cached, do_logout=True)
+            self._sessions.clear()
+        logger.info("CardDAV: shutdown OK")
 
     async def _get_session(self, username: str, password: str):
         """Zwraca (session, client) — cache trafia tylko gdy sha256(password) się zgadza."""
@@ -446,13 +465,50 @@ class CardDAVServer:
                 raise
             old = self._sessions.get(username)
             if old:
-                try:
-                    await old[1].__aexit__(None, None, None)
-                except Exception as exc:
-                    logger.debug("CardDAV: błąd zamykania starego klienta dla %s: %s", username, exc)
+                await self._close_cached_session(username, old, do_logout=True)
             self._sessions[username] = (session, client, pw_hash)
+            self._invalidate(username)
             logger.info("CardDAV: zalogowano %s", username)
             return session, client
+
+    async def _close_cached_session(self, username: str, cached: tuple, do_logout: bool) -> None:
+        """Zamyka klienta z cache. do_logout=True → najpierw DELETE /sys/session;
+        False → tylko close aiohttp (np. po 440 — token i tak nieważny)."""
+        session, client, _ = cached
+        if do_logout:
+            try:
+                await client.logout(session)
+            except Exception as exc:
+                logger.debug("CardDAV: logout %s zignorowany: %s", username, exc)
+        try:
+            await client.__aexit__(None, None, None)
+        except Exception as exc:
+            logger.debug("CardDAV: close klienta %s zignorowany: %s", username, exc)
+
+    async def _invalidate_session(self, username: str) -> None:
+        """Usuwa sesję z cache (po 440 SessionExpired)."""
+        old = self._sessions.pop(username, None)
+        self._invalidate(username)
+        if old:
+            await self._close_cached_session(username, old, do_logout=False)
+
+    async def _dispatch_with_relogin(self, req: "HTTPRequest") -> "HTTPResponse":
+        """Wokół _dispatch — przy 440 SessionExpired wywala sesję z cache i ponawia raz."""
+        try:
+            return await self._dispatch(req)
+        except TutaAPIError as e:
+            if e.status_code == 440:
+                auth = req.headers.get("authorization", "")
+                if auth.lower().startswith("basic "):
+                    try:
+                        decoded = base64.b64decode(auth[6:]).decode("utf-8")
+                        username = decoded.split(":", 1)[0]
+                        logger.info("CardDAV: 440 SessionExpired dla %s, invalidate + retry", username)
+                        await self._invalidate_session(username)
+                        return await self._dispatch(req)
+                    except Exception:
+                        pass
+            raise
 
     # -----------------------------------------------------------------------
     # Connection handler
@@ -468,7 +524,7 @@ class CardDAVServer:
                 writer.close()
                 return
             logger.info("CardDAV %s %s [%s:%d]", req.method, req.path, peer[0], peer[1])
-            resp = await self._dispatch(req)
+            resp = await self._dispatch_with_relogin(req)
             writer.write(resp.to_bytes())
             await writer.drain()
         except Exception as e:
@@ -898,6 +954,8 @@ class CardDAVServer:
                     "ETag": f'"{etag}"',
                 })
         except TutaAPIError as e:
+            if e.status_code == 440:
+                raise  # propagate do _dispatch_with_relogin
             logger.error("CardDAV PUT error: %s", e)
             return _text_resp(500, "Internal Server Error", str(e))
 

@@ -213,7 +213,7 @@ class IMAPConnection:
         self.mailbox: Optional[MailboxState] = None
         self._folders: Optional[list[MailFolder]] = None
         self._mail_group_key: Optional[bytes] = None
-        self._credentials: "tuple[str, str] | None" = None  # (email, password) — tylko do re-login na 401
+        self._credentials: "tuple[str, str] | None" = None  # (email, password) — do re-login na 401/440
         # Cache zbudowanych wiadomości RFC 2822 — kluczem jest element_id maila.
         # Unikamy przebudowy dla każdego partial fetch (BODY[]<offset.count>),
         # co gwarantuje też stałe granice MIME między żądaniami.
@@ -252,6 +252,23 @@ class IMAPConnection:
     # -----------------------------------------------------------------------
     # Główna pętla połączenia
     # -----------------------------------------------------------------------
+
+    async def graceful_logout(self) -> None:
+        """Wołane przez IMAPServer.stop() — wysyła BYE do klienta i DELETE /sys/session
+        do Tuty. Best-effort: błędy zignorowane, bo i tak zamykamy proces."""
+        self._stop_event_watcher()
+        try:
+            self._send("* BYE tuta-proxy shutdown")
+            await self.writer.drain()
+        except Exception:
+            pass
+        if self.session:
+            try:
+                await self.client.logout(self.session)
+            except Exception as exc:
+                logger.debug(f"[{self.peer}] logout zignorowany: {exc}")
+            self.session = None
+        self.state = "LOGOUT"
 
     async def handle(self) -> None:
         logger.info(f"[{self.peer}] Nowe połączenie")
@@ -343,13 +360,15 @@ class IMAPConnection:
         try:
             await handler(tag, args)
         except TutaAPIError as e:
-            if e.status_code == 401:
+            # 401 = NotAuthenticatedError, 440 = SessionExpiredError (Tuta extension).
+            # Oba znaczą "sesja wygasła" — próbujemy re-login bez zrywania IMAP.
+            if e.status_code in (401, 440):
                 if await self._try_relogin():
                     try:
                         await handler(tag, args)
                     except TutaAPIError as e2:
-                        if e2.status_code == 401:
-                            logger.warning(f"[{self.peer}] 401 po re-login — BYE")
+                        if e2.status_code in (401, 440):
+                            logger.warning(f"[{self.peer}] {e2.status_code} po re-login — BYE")
                             self._send("* BYE Session expired, please reconnect")
                             self.state = "LOGOUT"
                         else:
@@ -387,6 +406,7 @@ class IMAPConnection:
         if self.state == "SELECTED" and self.mailbox and self._pending_mail_ids and self.session:
             resolved = []
             inserted_any = False
+            relogin_attempted = False
             for elem_id, (list_id, _) in list(self._pending_mail_ids.items()):
                 try:
                     mail_raw = await self.client.get_single_mail(self.session, list_id, elem_id)
@@ -403,6 +423,24 @@ class IMAPConnection:
                                 self.peer, elem_id,
                             )
                             resolved.append(elem_id)
+                except TutaAPIError as e:
+                    # 401/440 — sesja wygasła. Spróbuj re-login raz; jeśli się uda,
+                    # ponów ten konkretny pending mail. Reszta wpadnie od razu na świeżą sesję.
+                    if e.status_code in (401, 440) and not relogin_attempted:
+                        relogin_attempted = True
+                        if await self._try_relogin():
+                            logger.info(f"[{self.peer}] NOOP: re-login OK po {e.status_code}, ponawiam {elem_id}")
+                            try:
+                                mail_raw = await self.client.get_single_mail(self.session, list_id, elem_id)
+                                if mail_raw and self._is_mail_decryptable(mail_raw) and self._insert_mail_raw(mail_raw):
+                                    logger.info(f"[{self.peer}] NOOP: mail {elem_id} wstrzyknięto po re-login")
+                                    resolved.append(elem_id)
+                                    inserted_any = True
+                                continue
+                            except Exception as e2:
+                                logger.debug(f"[{self.peer}] NOOP retry po re-login {elem_id}: {e2}")
+                                continue
+                    logger.debug(f"[{self.peer}] NOOP pending retry {elem_id}: {e}")
                 except Exception as e:
                     logger.debug(f"[{self.peer}] NOOP pending retry {elem_id}: {e}")
             for eid in resolved:
@@ -439,6 +477,8 @@ class IMAPConnection:
             self._no(tag, f"[AUTHENTICATIONFAILED] Login failed: {e}")
             return
 
+        # Zapamiętaj credentials — bez tego _try_relogin nie zadziała.
+        self._credentials = (username, password)
         self.state = "AUTH"
         logger.info(f"[{self.peer}] Logged in: {username}")
         self._ok(tag, "LOGIN completed")
@@ -482,6 +522,8 @@ class IMAPConnection:
             self._no(tag, f"[AUTHENTICATIONFAILED] Login failed: {e}")
             return
 
+        # Zapamiętaj credentials — bez tego _try_relogin nie zadziała.
+        self._credentials = (username, password)
         self.state = "AUTH"
         logger.info(f"[{self.peer}] Logged in via AUTHENTICATE PLAIN: {username}")
         self._ok(tag, "AUTHENTICATE completed")
@@ -492,8 +534,8 @@ class IMAPConnection:
 
     async def _try_relogin(self) -> bool:
         """
-        Próbuje odświeżyć sesję Tuta bez zrywania połączenia IMAP.
-        Używane gdy API zwróci 401 w trakcie aktywnej sesji.
+        Odświeża sesję Tuta bez zrywania połączenia IMAP.
+        Wołane przy 401 (NotAuthenticated) i 440 (SessionExpired) z API.
         Czyści _folders i _mail_group_key — będą pobrane ponownie przy następnym użyciu.
         """
         if not self._credentials:
@@ -1909,6 +1951,7 @@ class IMAPConnection:
         # Czekamy aż mail będzie dekrypowalny (pole 102 lub 1310) ORAZ
         # pole 1465 (mailSet) będzie wypełnione (potrzebne do przypisania do folderu).
         mail_raw = None
+        relogin_attempted = False
         for attempt in range(5):
             if attempt > 0:
                 await asyncio.sleep(2 ** (attempt - 1))  # 1, 2, 4, 8 s
@@ -1923,6 +1966,17 @@ class IMAPConnection:
                     "[%s] IDLE: mail %s attempt %d: dec=%s, 1465=%r, dec_ready=%s",
                     self.peer, element_id, attempt + 1, dec, mail_raw.get("1465"), dec_ready,
                 )
+            except TutaAPIError as e:
+                # 401/440 — sesja wygasła w czasie wiszącej sesji IDLE. Próbujemy
+                # re-login raz; jeśli się uda, pętla zrobi kolejny attempt z nową sesją.
+                if e.status_code in (401, 440) and not relogin_attempted:
+                    relogin_attempted = True
+                    if await self._try_relogin():
+                        logger.info(f"[{self.peer}] IDLE: re-login OK po {e.status_code}, ponawiam fetch {element_id}")
+                        mail_raw = None
+                        continue
+                logger.warning(f"[{self.peer}] IDLE new mail fetch {element_id} attempt {attempt + 1}: {e}")
+                mail_raw = None
             except Exception as e:
                 logger.warning(f"[{self.peer}] IDLE new mail fetch {element_id} attempt {attempt + 1}: {e}")
                 mail_raw = None
@@ -2160,6 +2214,8 @@ class IMAPServer:
         self.port = port
         self.cache_path = cache_path
         self._server: Optional[asyncio.AbstractServer] = None
+        # Aktywne połączenia — używane przez stop() do graceful logout każdej sesji.
+        self._connections: "set[IMAPConnection]" = set()
         # Deduplikacja APPEND: {(email, sha256_hex) → monotonic_time}
         # Chroniony przed race condition bo asyncio jest single-threaded.
         self._append_dedup: "dict[tuple[str, str], float]" = {}
@@ -2180,12 +2236,26 @@ class IMAPServer:
             await self._server.serve_forever()
 
     async def stop(self) -> None:
+        """Graceful shutdown: przestań przyjmować nowe połączenia, wyloguj każdą
+        aktywną sesję IMAP (DELETE /sys/session w Tucie), zamknij współdzielonego
+        klienta i cache."""
         if self._server:
             self._server.close()
+            try:
+                await self._server.wait_closed()
+            except Exception as exc:
+                logger.debug("IMAP: wait_closed: %s", exc)
+        if self._connections:
+            logger.info("IMAP: graceful logout %d aktywnych połączeń", len(self._connections))
+            await asyncio.gather(
+                *(c.graceful_logout() for c in list(self._connections)),
+                return_exceptions=True,
+            )
         if self._tuta:
             await self._tuta.__aexit__(None, None, None)
         if hasattr(self, "_cache"):
             self._cache.close()
+        logger.info("IMAP: shutdown OK")
 
     async def _handle_connection(
         self,
@@ -2193,7 +2263,11 @@ class IMAPServer:
         writer: asyncio.StreamWriter,
     ) -> None:
         conn = IMAPConnection(reader, writer, self._tuta, self._cache, self._append_dedup)
-        await conn.handle()
+        self._connections.add(conn)
+        try:
+            await conn.handle()
+        finally:
+            self._connections.discard(conn)
 
 
 # ---------------------------------------------------------------------------

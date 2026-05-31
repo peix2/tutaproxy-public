@@ -299,6 +299,7 @@ Nadawca = From, Do = To, Temat = Subject).*
 - For each CalDAV/CardDAV/WebDAV request the proxy compares `sha256(password)` against the cached session hash in constant time; a cached session is reused only when the hash matches.
 - All actual email data is fetched from Tuta's servers over HTTPS. Decryption happens in the proxy process on your machine.
 - The proxy verifies the HMAC tag on Tuta's AesCbcThenHmac ciphertexts. As of v1.3.2 this is **warn-only**: a mismatch logs a warning (with a short non-sensitive key fingerprint) but decryption proceeds. Strict mode (raise on mismatch, with a `TUTA_SKIP_HMAC=1` kill-switch) is planned after an observation period.
+- Sessions are torn down gracefully on shutdown (since v1.3.3): `SIGTERM`/`SIGINT` triggers a `DELETE /sys/session` for every cached IMAP/CalDAV/CardDAV/WebDAV session, and SMTP logs out after each send. Without this, Tuta's "Active sessions" list would accumulate stale entries until the token TTL expired (hours).
 
 ---
 

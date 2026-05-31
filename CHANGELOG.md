@@ -7,6 +7,62 @@ Versioning: [Semantic Versioning](https://semver.org/) — MAJOR.MINOR.PATCH.
 
 ---
 
+## [1.3.3] — 2026-05-31
+
+### Fixed
+
+- **IMAP push lost mail after long IDLE — fixed.** After hours of IDLE, Tuta
+  returned `440 SessionExpiredError` for `get_single_mail`. The proxy only
+  handled re-login for `401 NotAuthenticatedError`, so the WebSocket-triggered
+  fetch retried 3× with exponential backoff (1/2/4s), all 440, and the mail
+  was dumped into `_pending_mail_ids`. NOOP retried it with the same expired
+  session and got the same 440 — the mail never reached Thunderbird.
+
+  Additionally, `_credentials` (the `(email, password)` tuple `_try_relogin`
+  needs) was **never assigned** in `_cmd_login`/`_cmd_authenticate` — the
+  entire 401 re-login path was dead code. Both fixed in this release: command
+  handler, `_idle_handle_new_mail`, and NOOP pending retry now treat 440 the
+  same as 401 and call `_try_relogin()` before retrying once.
+
+- **DAV — same fix for CalDAV, CardDAV, WebDAV.** Each DAV server's
+  `_get_session` cache returned the same expired session for every subsequent
+  request until the client changed password. Each server now has
+  `_invalidate_session(email)` and a `_dispatch_with_relogin(req)` wrapper:
+  on 440 the cached session is dropped and the request runs once more,
+  re-authenticating via the password from Basic auth. Handlers that previously
+  caught `TutaAPIError` locally now propagate 440 to the wrapper
+  (`if status_code == 440: raise`).
+
+- **Session leak in Tuta UI — fixed.** `TutaClient.logout()`
+  (`DELETE /sys/session/{accessToken}`) existed but **was never called**.
+  Sessions accumulated in Tuta's "Active sessions" list with every proxy
+  restart, every Thunderbird restart, and every SMTP send (Tuta's access
+  token TTL is several hours, so they only cleaned up on their own).
+
+  Fixes:
+  - `IMAPServer` now tracks active `IMAPConnection`s in a set. New
+    `IMAPConnection.graceful_logout()` sends `* BYE` and calls
+    `client.logout(session)`. `IMAPServer.stop()` runs them in parallel.
+  - SMTP creates a fresh session per `handle_DATA` call → added `finally`
+    block with `client.logout()`.
+  - CalDAV/CardDAV/WebDAV previously had **no `stop()` method at all**.
+    Each now closes the listener, logs out every cached session, and closes
+    the aiohttp clients.
+  - `run_proxy.py` had no `SIGTERM` handler. `docker stop` sends SIGTERM
+    (not SIGINT), so `KeyboardInterrupt` in `run_proxy.py`'s `try/except`
+    never fired in a container and the (incomplete) cleanup was dead code.
+    Now uses `loop.add_signal_handler(SIGTERM, ...)` and an `asyncio.Event`
+    to trigger `stop()` on all five servers with a 15s timeout. Previous
+    code also only called `imap.stop()` and `smtp.stop()` in `finally`,
+    skipping all three DAV servers — fixed.
+
+### Verification
+
+After deploying, check Tuta UI → Settings → Login → Active sessions. The list
+should no longer grow after each `docker stop tutaproxy`.
+
+---
+
 ## [1.3.2] — 2026-05-29
 
 ### Security
