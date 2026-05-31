@@ -834,8 +834,14 @@ class CalDAVServer:
                 headers[name.strip().lower()] = value.strip()
 
         # Odczyt body
+        MAX_BODY = 50 * 1024 * 1024  # 50 MB — kalendarz nie potrzebuje więcej
         body = b""
-        cl = int(headers.get("content-length", "0") or "0")
+        try:
+            cl = int(headers.get("content-length", "0") or "0")
+        except ValueError:
+            return None
+        if cl > MAX_BODY:
+            return None
         if cl > 0:
             try:
                 body = await asyncio.wait_for(reader.read(cl), timeout=15)

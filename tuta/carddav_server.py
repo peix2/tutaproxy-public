@@ -557,8 +557,14 @@ class CardDAVServer:
                 k, v = decoded.split(":", 1)
                 headers[k.strip().lower()] = v.strip()
 
+        MAX_BODY = 50 * 1024 * 1024  # 50 MB — kontakty nie potrzebują więcej
         body = b""
-        cl = int(headers.get("content-length", "0") or "0")
+        try:
+            cl = int(headers.get("content-length", "0") or "0")
+        except ValueError:
+            return None
+        if cl > MAX_BODY:
+            return None
         if cl > 0:
             body = await asyncio.wait_for(reader.readexactly(cl), timeout=30)
 

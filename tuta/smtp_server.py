@@ -16,6 +16,7 @@ Uwierzytelnienie: AUTH PLAIN lub AUTH LOGIN.
 """
 
 import asyncio
+import html
 import logging
 from email import message_from_bytes
 from email.header import decode_header, make_header
@@ -54,7 +55,7 @@ def _extract_body_and_attachments(
             return "<html><body></body></html>", []
         text = payload.decode(charset, errors="replace")
         if ct != "text/html":
-            text = f"<html><body><pre>{text}</pre></body></html>"
+            text = f"<html><body><pre>{html.escape(text)}</pre></body></html>"
         return text, []
 
     html_part = None
@@ -90,7 +91,7 @@ def _extract_body_and_attachments(
     charset = chosen.get_content_charset() or "utf-8"
     body = chosen.get_payload(decode=True).decode(charset, errors="replace")
     if chosen.get_content_type() == "text/plain":
-        body = f"<html><body><pre>{body}</pre></body></html>"
+        body = f"<html><body><pre>{html.escape(body)}</pre></body></html>"
     return body, attachments
 
 

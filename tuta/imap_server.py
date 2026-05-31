@@ -20,6 +20,7 @@ Nie obsługujemy (M4+):
 
 import asyncio
 import base64
+import html
 import hashlib
 import logging
 import re
@@ -86,7 +87,7 @@ def _rfc2822_body_html(msg) -> str:
         charset = part.get_content_charset() or "utf-8"
         payload = part.get_payload(decode=True).decode(charset, errors="replace")
         if part.get_content_type() == "text/plain":
-            payload = f"<html><body><pre>{payload}</pre></body></html>"
+            payload = f"<html><body><pre>{html.escape(payload)}</pre></body></html>"
         return payload
     ct = msg.get_content_type()
     charset = msg.get_content_charset() or "utf-8"
@@ -95,7 +96,7 @@ def _rfc2822_body_html(msg) -> str:
         return "<html><body></body></html>"
     text = payload.decode(charset, errors="replace")
     if ct != "text/html":
-        text = f"<html><body><pre>{text}</pre></body></html>"
+        text = f"<html><body><pre>{html.escape(text)}</pre></body></html>"
     return text
 
 
