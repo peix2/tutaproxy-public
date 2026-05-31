@@ -1,309 +1,325 @@
 # Changelog
 
-All notable changes to tutaproxy will be documented here.
+## v1.3.4 — 2026-06-01 — Telemetria: sprawdzanie wersji + liczenie instalacji
 
-Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
-Versioning: [Semantic Versioning](https://semver.org/) — MAJOR.MINOR.PATCH.
+Opcjonalna telemetria (domyślnie włączona, wyłącz: `TUTAPROXY_TELEMETRY=false`).
 
----
+- Przy starcie loguje dokładnie co jest wysyłane — pełna transparentność.
+- Wysyła ping (UUID instalacji + wersja) do serwera zliczającego raz na 24h.
+- Sprawdza GitHub Releases czy dostępna jest nowsza wersja (loguje WARNING jeśli tak).
+- UUID generowany losowo, przechowywany w `/data/.tutaproxy-id` — nie jest powiązany
+  z kontem Tuta ani żadnymi danymi użytkownika.
 
-## [1.3.3] — 2026-05-31
+Pliki: `tuta/telemetry.py`, `run_proxy.py`, `docker/docker-compose.yml`.
 
-### Fixed
+## v1.3.3 — 2026-05-31 — Session lifecycle: 440 re-login + graceful shutdown
 
-- **IMAP push lost mail after long IDLE — fixed.** After hours of IDLE, Tuta
-  returned `440 SessionExpiredError` for `get_single_mail`. The proxy only
-  handled re-login for `401 NotAuthenticatedError`, so the WebSocket-triggered
-  fetch retried 3× with exponential backoff (1/2/4s), all 440, and the mail
-  was dumped into `_pending_mail_ids`. NOOP retried it with the same expired
-  session and got the same 440 — the mail never reached Thunderbird.
+Trzy powiązane fixy dotyczące cyklu życia sesji Tuta.
 
-  Additionally, `_credentials` (the `(email, password)` tuple `_try_relogin`
-  needs) was **never assigned** in `_cmd_login`/`_cmd_authenticate` — the
-  entire 401 re-login path was dead code. Both fixed in this release: command
-  handler, `_idle_handle_new_mail`, and NOOP pending retry now treat 440 the
-  same as 401 and call `_try_relogin()` before retrying once.
+### Bug — IMAP nie reagował na 440 SessionExpired (push mejli ginął)
 
-- **DAV — same fix for CalDAV, CardDAV, WebDAV.** Each DAV server's
-  `_get_session` cache returned the same expired session for every subsequent
-  request until the client changed password. Each server now has
-  `_invalidate_session(email)` and a `_dispatch_with_relogin(req)` wrapper:
-  on 440 the cached session is dropped and the request runs once more,
-  re-authenticating via the password from Basic auth. Handlers that previously
-  caught `TutaAPIError` locally now propagate 440 to the wrapper
-  (`if status_code == 440: raise`).
+Po dłuższym IDLE (godziny) Tuta zwracała `440 SessionExpiredError` przy próbie
+pobrania nowego maila. Proxy obsługiwało re-login wyłącznie dla 401
+(`NotAuthenticatedError`). Skutek: WebSocket event przychodził, `get_single_mail`
+dostawało 3× 440 (exp backoff 1/2/4s), mail wpadał do `_pending_mail_ids`,
+NOOP też retry'ował z wygasłą sesją → mail nigdy nie docierał do Thunderbirda.
 
-- **Session leak in Tuta UI — fixed.** `TutaClient.logout()`
-  (`DELETE /sys/session/{accessToken}`) existed but **was never called**.
-  Sessions accumulated in Tuta's "Active sessions" list with every proxy
-  restart, every Thunderbird restart, and every SMTP send (Tuta's access
-  token TTL is several hours, so they only cleaned up on their own).
+Dodatkowo `_credentials` (tuple email+password potrzebny do `_try_relogin`)
+**nigdy nie był ustawiany** w `_cmd_login`/`_cmd_authenticate` — cały istniejący
+re-login na 401 był martwym kodem.
 
-  Fixes:
-  - `IMAPServer` now tracks active `IMAPConnection`s in a set. New
-    `IMAPConnection.graceful_logout()` sends `* BYE` and calls
-    `client.logout(session)`. `IMAPServer.stop()` runs them in parallel.
-  - SMTP creates a fresh session per `handle_DATA` call → added `finally`
-    block with `client.logout()`.
-  - CalDAV/CardDAV/WebDAV previously had **no `stop()` method at all**.
-    Each now closes the listener, logs out every cached session, and closes
-    the aiohttp clients.
-  - `run_proxy.py` had no `SIGTERM` handler. `docker stop` sends SIGTERM
-    (not SIGINT), so `KeyboardInterrupt` in `run_proxy.py`'s `try/except`
-    never fired in a container and the (incomplete) cleanup was dead code.
-    Now uses `loop.add_signal_handler(SIGTERM, ...)` and an `asyncio.Event`
-    to trigger `stop()` on all five servers with a 15s timeout. Previous
-    code also only called `imap.stop()` and `smtp.stop()` in `finally`,
-    skipping all three DAV servers — fixed.
+Fix:
+- `_cmd_login` i `_cmd_authenticate` zapisują `self._credentials` po sukcesie.
+- Command handler, `_idle_handle_new_mail` i NOOP pending retry traktują 440
+  tak samo jak 401: invalidate session, `_try_relogin()`, ponów raz.
 
-### Verification
+Pliki: `tuta/imap_server.py`.
 
-After deploying, check Tuta UI → Settings → Login → Active sessions. The list
-should no longer grow after each `docker stop tutaproxy`.
+### DAV — to samo dla CalDAV/CardDAV/WebDAV
 
----
+DAV cache `_get_session` zwracał starą sesję dla cached emaila bez sprawdzenia
+czy access token jeszcze żyje. Po 440 SessionExpired każdy kolejny request
+też dostawał 440 aż klient zmienił hasło.
 
-## [1.3.2] — 2026-05-29
+Fix: każdy serwer DAV dostał `_invalidate_session(email)` i wrapper
+`_dispatch_with_relogin(req)` — przy 440 wywala sesję z cache i ponawia
+cały request raz (świeży `_get_session` zaloguje nową). Handlery które łapały
+TutaAPIError lokalnie teraz przepuszczają 440 do wrappera (`if status_code == 440: raise`).
 
-### Security
+Pliki: `tuta/caldav_server.py`, `tuta/carddav_server.py`, `tuta/webdav_server.py`.
 
-- **DAV auth bypass — fixed.** `_get_session` in `caldav_server.py`,
-  `carddav_server.py`, and `webdav_server.py` cached the logged-in session keyed
-  by email only. A second request with the same email and any password received
-  the first user's session. The cache now stores `(session, client, sha256(password))`
-  and only returns the cached session when `hmac.compare_digest()` confirms the
-  password hash matches. On mismatch the normal login flow runs and Tuta rejects
-  the wrong password. The previous client is closed before the cache entry is
-  replaced.
+### Graceful shutdown — naprawienie wycieku sesji w UI Tuty
 
-- **Default bind 0.0.0.0 → 127.0.0.1.** `run_proxy.py` defaulted to `0.0.0.0`
-  despite the README claiming "binds to 127.0.0.1 by default". Without TLS
-  between the client and the proxy, the Tuta password and full account would be
-  exposed if the proxy were started outside Docker on a host with an open network
-  interface. Defaults are now `127.0.0.1` for all five services. Docker still
-  binds to `0.0.0.0` inside the container (required for port mapping) via
-  `ENV` in the Dockerfile.
+`TutaClient.logout()` (DELETE `/sys/session/{accessToken}`) istniał ale **nigdzie
+nie był wołany**. Skutki w UI Tuty: dziesiątki "active sessions" zostawianych
+po każdym restarcie proxy, każdym restarcie Thunderbirda, każdym uruchomieniu
+SMTP send. Token TTL Tuty to wiele godzin — sesje czyściły się dopiero same.
 
-- **Dockerfile: missing `TUTA_WEBDAV_HOST` and `EXPOSE 5234`.** WebDAV (added in
-  v1.3.0) was previously reachable from the host only because `run_proxy.py`
-  defaulted to `0.0.0.0`. With the default-bind fix above, the omission in
-  `Dockerfile` surfaced as a regression (mount via davfs failed with
-  "Connection reset"). Both env var and `EXPOSE` are now in place.
-  **Rebuild required:** `docker-compose up -d --build`.
+Dodatkowo:
+- DAV serwery (caldav/carddav/webdav) nie miały w ogóle metody `stop()`.
+- `run_proxy.py` w `finally` wołał tylko `imap.stop()` i `smtp.stop()` —
+  pomijał wszystkie 3 DAV-y.
+- Brak `SIGTERM` handlera — `docker stop` wysyła SIGTERM (nie SIGINT), więc
+  `KeyboardInterrupt` w `run_proxy.py` nigdy się nie wyzwalał w kontenerze.
+  Cały (ograniczony) cleanup był ignorowany.
 
-- **HMAC verification in `aes_decrypt_tuta` — warn-only mode.** The function
-  previously discarded the HMAC bytes entirely ("HMAC verification optional"
-  comment). It now computes the expected HMAC over `IV || ciphertext` with the
-  derived HMAC subkey and compares in constant time. On mismatch it logs a
-  `WARNING` (including a non-sensitive 8-char SHA256 fingerprint of the key and
-  the ciphertext length) but continues decryption. This is observability without
-  regression risk on any legacy ciphertext formats. After an observation period
-  with no warnings in production traffic, the function should be promoted to
-  strict mode (raise `ValueError` on mismatch), with an optional kill-switch
-  via `TUTA_SKIP_HMAC=1`.
+Fix:
+- IMAPServer trzyma `self._connections: set[IMAPConnection]`; nowa metoda
+  `IMAPConnection.graceful_logout()` wysyła `* BYE` i `client.logout(session)`.
+  `IMAPServer.stop()` woła ją równolegle dla wszystkich aktywnych.
+- SMTP loguje świeżą sesję per-request → dodany `finally` z `client.logout`
+  po każdym `handle_DATA`.
+- CalDAV/CardDAV/WebDAV mają teraz `stop()` które zamyka listener, loguje
+  wszystkie sesje z cache (`client.logout`) i zamyka klientów aiohttp.
+- `run_proxy.py` rejestruje `SIGTERM`/`SIGINT` przez `loop.add_signal_handler`
+  i woła `stop()` na wszystkich 5 serwerach z timeoutem 15s.
 
-- **HTTP 401 returns 401 (was 502).** `TutaAuthError` (subclass of
-  `TutaAPIError`) was defined but never raised, so DAV `except TutaAuthError`
-  handlers never fired and wrong passwords fell through to `TutaAPIError`,
-  returning 502 Bad Gateway. A new `_api_error()` factory in `api.py` returns
-  `TutaAuthError` for status 401 and `TutaAPIError` otherwise. All HTTP error
-  raise sites (`_get`, `_get_tutanota`, `_post`, `_delete`, and ~30 inline call
-  sites) now go through this factory.
+Pliki: `tuta/imap_server.py`, `tuta/smtp_server.py`, `tuta/caldav_server.py`,
+`tuta/carddav_server.py`, `tuta/webdav_server.py`, `run_proxy.py`.
 
----
+Test po wdrożeniu: w UI Tuty (Settings → Login → Active sessions) lista po
+`docker stop tutaproxy` powinna być pusta (lub przynajmniej nie rosnąć po
+każdym restarcie).
 
-## [1.3.1] — 2026-05-29
+## v1.3.2 — 2026-05-29 — Security fixy po review
 
-### Fixed
-- **WebDAV DELETE returned 502 Bad Gateway** — the `restore` field (field `105`) in the
-  `DriveFolderServiceDeleteIn` request body was sent as a JSON boolean `false` instead of
-  the string `"0"`. Tuta's API serializes Boolean values as `"0"`/`"1"` strings and rejected
-  the raw boolean with an error, causing every DELETE to fail.
+Trzy poprawki bezpieczeństwa znalezione w sesji review. Szczegóły i uzasadnienia
+wyborów w README, sekcja "Poprawki bezpieczeństwa — 2026-05-29".
 
----
+### Security — DAV auth bypass (krytyczne)
 
-## [1.3.0] — 2026-05-29
+CalDAV/CardDAV/WebDAV `_get_session` cachowało sesję po samym emailu, bez
+weryfikacji hasła. Drugi request z innym hasłem dla tego samego emaila
+dostawał pełną sesję pierwszego.
 
-### Added
-- **WebDAV server / Tuta Drive** — new WebDAV server on port `5234` exposes your Tuta Drive
-  file storage to any WebDAV client. Mount it with davfs2, rclone, GNOME Files (Nautilus),
-  macOS Finder, or Windows network drive. Supports browse, download, upload, rename, move,
-  create folder, and delete.
-  - Large files are automatically split into 10 MB chunks and uploaded sequentially.
-  - Uploads are retried up to 3 times on network errors.
-  - Blob access token is refreshed automatically if it expires mid-upload.
-  - davfs2 duplicate PUT deduplication: if davfs2 sends a second PUT for the same file
-    (it does this when the first takes a long time), the second request is a no-op.
-  - Newly uploaded files are pinned in the local listing for 5 minutes to work around
-    Tuta Drive's eventual consistency (new files may not appear in the API listing immediately).
-- `run_webdav.py` — standalone entry point for the WebDAV server.
-- `TUTA_WEBDAV_HOST` / `TUTA_WEBDAV_PORT` environment variables.
+Fix: cache trzyma `(session, client, sha256(password))`. Hit cache tylko gdy
+`hmac.compare_digest(stored_hash, sha256(password))`. Mismatch → normalna
+ścieżka logowania (Tuta odrzuca złe hasło). Stary klient zamykany przy zmianie hasła.
 
-### Changed
-- `run_proxy.py` now starts the WebDAV server alongside IMAP, SMTP, CalDAV, and CardDAV.
-- Docker: port `5234` (WebDAV) is now exposed and mapped to `127.0.0.1:5234`.
+Pliki: `tuta/caldav_server.py`, `tuta/carddav_server.py`, `tuta/webdav_server.py`.
+
+### Security — default bind 0.0.0.0 → 127.0.0.1
+
+`run_proxy.py` miało `0.0.0.0` jako default mimo deklaracji w README "127.0.0.1
+by default". Bez TLS-a hasło Tuty i całe konto eksponowane przy uruchomieniu
+poza Dockerem. Docker nadpisuje przez ENV w Dockerfile — nie zmieniony.
+
+Plik: `run_proxy.py` (5 defaultów + docstring).
+
+**Regresja w Dockerfile (wykryta przy teście WebDAV mount)**: Dockerfile nie
+ustawiał `TUTA_WEBDAV_HOST=0.0.0.0` ani `EXPOSE 5234` — WebDAV (M10) został
+dodany po początkowej wersji obrazu i Dockerfile pominął te env vars. Wcześniej
+maskowane przez default `0.0.0.0` w `run_proxy.py`; po fixie tego defaultu
+WebDAV bindował na 127.0.0.1 wewnątrz kontenera, port mapping Dockera (host
+127.0.0.1:5234 → kontener 5234) nie miał jak dojść. Mount `davfs` dostawał
+"Połączenie zerwane przez drugą stronę".
+
+Fix: dodano `TUTA_WEBDAV_HOST=0.0.0.0`, `TUTA_WEBDAV_PORT=5234` i `5234`
+do `EXPOSE`. Wymaga przebudowy obrazu: `docker-compose up -d --build`.
+
+Plik: `docker/Dockerfile`.
+
+### Security — HMAC weryfikacja w aes_decrypt_tuta (warn-only)
+
+`aes_decrypt_tuta` ignorował HMAC ("weryfikacja opcjonalna"). Tryb warn-only:
+oczekiwany HMAC porównywany stałoczasowo, mismatch → `logger.warning(...)`
+z fingerprintem klucza, ale deszyfrowanie kontynuowane.
+
+Wybór warn-only zamiast strict: komentarz w kodzie sugerował że strict mógłby
+łamać działanie na nietypowych danych Tuty. Po okresie obserwacji bez warningów
+plan: tryb strict z ENV `TUTA_SKIP_HMAC=1` jako kill-switch (szczegóły w README).
+
+Pliki: `tuta/crypto.py` (dodano `import logging`, `logger`, weryfikacja HMAC).
 
 ---
 
-## [1.2.4] — 2026-05-28
+## v1.3.1 — 2026-05-29
 
-### Fixed
-- **Deleting the last calendar event no longer fails with "modification failed"** — Thunderbird
-  sends `PUT /` with an empty `VCALENDAR` (no `VEVENT` blocks) when deleting the last event.
-  The proxy was rejecting this with `400 Bad Request`, which Thunderbird reported as
-  "modification failed" and marked the calendar as "temporarily unavailable". Fixed by treating
-  an empty `VCALENDAR` as a valid diff: all UIDs from the last snapshot are deleted.
-
-- **Deleting a recurring event series now also removes override events** — when a recurring
-  event has a modified occurrence (stored as a separate Tuta event with the same UID and
-  `recurrenceId` set), deleting the series left the override orphaned in Tuta. On the next
-  sync, the proxy emitted a `RECURRENCE-ID` without its required master event, causing
-  Thunderbird to reject the entire calendar. Fixed by tracking all events per UID (`uid_to_all`)
-  and deleting every one of them when the UID is absent from the blob PUT body.
-
-- **Orphan override events no longer break CalDAV sync** — if a stale orphan override exists
-  in Tuta (override without a matching master), it is now emitted as a regular event without
-  `RECURRENCE-ID` rather than causing the calendar to be invalid.
+### Fix
+- **WebDAV DELETE zwracał 502**: pole `105` (`restore`) w ciele `DriveFolderServiceDeleteIn`
+  wysyłane jako Python `False` (JSON `false`) zamiast stringa `"0"`.
+  Tuta API serializuje Boolean jako `"0"`/`"1"` — raw boolean był odrzucany przez serwer.
 
 ---
 
-## [1.2.3] — 2026-05-28
+## v1.3.0 — 2026-05-28 (WebDAV — Tuta Drive)
 
-### Fixed
-- **Modified recurring event occurrences now appear correctly in Thunderbird** — when a
-  single occurrence of a recurring event is modified in Tuta (e.g. moved from 2 PM to 3 PM),
-  it now shows up as expected in CalDAV clients instead of disappearing.
+### WebDAV server (Tuta Drive)
 
-  Root cause 1 — EXDATE/RECURRENCE-ID conflict: Tuta internally stores both an `EXDATE` on
-  the master event (marking the original occurrence as removed) and a separate override event
-  with `recurrenceId` set. RFC 5545 §3.8.5.1 gives `EXDATE` precedence over `RECURRENCE-ID`,
-  so Thunderbird deleted the occurrence and ignored the override. Fixed by omitting `EXDATE`
-  entries that have a corresponding `RECURRENCE-ID` override.
+- **`files_list_id` (pole 38) jako lista**: pole zwracane przez API jako `["listId"]`,
+  nie string — fix: `isinstance(files_list_id_raw, list)` zamiast zakładania stringa.
+  Bez tego fix każdy folder zwracał `[], []` (0 plików, 0 podfolderów).
 
-  Root cause 2 — timezone mismatch in timestamp comparison: `datetime.utcfromtimestamp()`
-  returns a naïve datetime that `datetime.timestamp()` then interprets as local time (e.g.
-  UTC+12), producing a 12-hour offset that prevented the EXDATE filter from matching.
-  Fixed by attaching UTC tzinfo before calling `timestamp()`.
+- **Multi-chunk upload**: split na 10 MB chunki, szyfrowanie AES-256 per chunk,
+  retry × 3, auto-refresh blob tokenu (403 → nowy token), timeout 10 min per chunk.
 
-- **`RECURRENCE-ID` uses the master event's timezone** — the override event inherits the
-  master's `TZID` (e.g. `Pacific/Auckland`) so that `RECURRENCE-ID;TZID=Pacific/Auckland:`
-  matches the original occurrence's `DTSTART` format, as required by RFC 5545 §3.8.4.4.
+- **Deduplicacja równoległych PUT**: `asyncio.Lock` per ścieżka + pinned files cache (5 min TTL).
+
+- **Eventual consistency**: pinned files domieszane do listingu folderu przez 5 min.
 
 ---
 
-## [1.2.2] — 2026-05-28
+## v1.2.4 — 2026-05-28 (CalDAV blob DELETE — fixy)
 
-### Fixed
-- **VTIMEZONE block included in CalDAV iCal export** — recurring events with a non-UTC
-  timezone (e.g. `Europe/Warsaw`) were exported with `DTSTART;TZID=...` but without the
-  required `VTIMEZONE` component in the same `VCALENDAR`. RFC 5545 requires a `VTIMEZONE`
-  block whenever a `TZID` is referenced. Fixed by generating `VTIMEZONE` blocks dynamically
-  from the IANA timezone database (`zoneinfo`, stdlib) — one block per unique timezone used
-  across all events, inserted between the `VCALENDAR` header and the `VEVENT` blocks.
-  No new dependencies.
+### Dwa bugi w blob PUT DELETE
 
----
+**Bug 1: orphan override po usunięciu cyklu**
 
-## [1.2.1] — 2026-05-27
+Thunderbird usuwa eventy cykliczne przez blob PUT (GET / → PUT / z pominiętym UID).
+`uid_map` był słownikiem `safe_uid → CalendarEvent`, więc przy jednym UID z masterem
+i overridem (recurrence_id) słownik trzymał tylko jeden z nich. DELETE pętla usuwała
+tylko jeden event — orphan override z `recurrence_id` zostawał w Tucie. Przy kolejnym
+GET / proxy emitowało go jako RECURRENCE-ID bez mastera — Thunderbird odrzucał cały
+kalendarz ("temporarily unavailable").
 
-### Fixed
-- **Bulk contact delete no longer stalls** — deleting many contacts at once (e.g. select-all
-  in CardBook) previously stopped after ~100 deletions and required a manual sync to continue.
-  Root cause: each DELETE triggered a separate Tuta API call; CardBook's per-cycle operation
-  limit was hit quickly. Fixed by batching concurrent DELETE requests: handlers arriving within
-  150 ms of each other are collected and sent as a single `eraseMultiple` call
-  (`DELETE /rest/tutanota/contact/{listId}?ids=id1,id2,...`), matching the endpoint used by
-  Tuta's own clients. Bulk delete now runs continuously without pausing.
+Fix: `uid_to_all: dict[str, list]` — mapuje UID → lista WSZYSTKICH eventów z tym UID.
+DELETE pętla iteruje po liście i usuwa każdy z nich.
 
----
+**Bug 2: "modification failed" przy usuwaniu ostatniego eventu**
 
-## [1.2.0] — 2026-05-27
+Thunderbird wysyła PUT / z pustym VCALENDAR (zero VEVENT) przy usuwaniu ostatniego
+eventu w kalendarzu. Kod zwracał `400 Bad Request` ("brak VEVENT") — Thunderbird
+wyświetlał "modification failed".
 
-### Added
-- **CardDAV server** — CardDAV server on port `5233` exposes all Tuta contacts to standard
-  contacts clients (CardBook for Thunderbird, Apple Contacts, etc.). Supports read, create,
-  update, and delete. Contacts are exported and imported as vCard 3.0, including email
-  addresses, phone numbers, postal addresses, websites, and birthday. Use your Tuta
-  credentials to authenticate.
-- `run_carddav.py` — standalone entry point for the CardDAV server.
+Fix: pusty VCALENDAR traktowany jak normalny diff — `put_uids = set()`, wszystkie
+snapshottowane eventy usuwane. Tylko brak BEGIN:VCALENDAR lub pusty body zwraca 400.
 
-### Fixed
-- Proxy (`run_proxy.py`) now starts CardDAV alongside IMAP, SMTP, and CalDAV.
+**Zmiany w `caldav_server.py`**:
+- `_handle_put` blob mode: `uid_to_all` zamiast `uid_map` w DELETE pętli
+- `_handle_put` blob mode: pusty VCALENDAR nie zwraca 400
+- `events_to_ical`: orphan override emitowany jako regularny event zamiast pominięcia
 
 ---
 
-## [1.1.0] — 2026-05-27
+## v1.2.3 — 2026-05-28 (RECURRENCE-ID dla wyjątków cyklu)
 
-### Added
-- **CalDAV server** — CalDAV server on port `5232` exposes all Tuta calendars to standard
-  calendar clients (Thunderbird via TbSync, Apple Calendar, etc.). Supports read, create,
-  update, and delete. Events include full recurrence support (RRULE), timezone handling,
-  and all standard iCalendar fields. Use your Tuta credentials to authenticate.
+Gdy użytkownik modyfikuje jedno powtórzenie eventu cyklicznego w Tucie, Tuta tworzy
+drugi `CalendarEvent` z tym samym `uid` i ustawionym polem `recurrenceId` (1320).
+Proxy nie odczytywało tego pola — Thunderbird nie mógł połączyć wyjątku z cyklem.
 
-### Fixed
-- **Secure External replies now appear in Thunderbird automatically** — previously a reply
-  sent from Tuta's Secure External portal would only appear in Thunderbird after the user
-  opened the mail in Tuta's web app first. Root cause: a 2–3 second WebSocket gap between
-  consecutive IMAP IDLE sessions during which Tuta's CREATE event arrived and was silently
-  dropped. Fixed by running a persistent background WebSocket watcher for the entire IMAP
-  session that buffers events in a queue; IDLE and NOOP drain from that queue instead of
-  opening a new WebSocket per session.
-- **PQ decaps graceful failure** — Tuta briefly sets field `2045` (`pubEncBucketKey`) to
-  `null` in JSON while processing new mail. Previously this caused a `TypeError: a bytes-like
-  object is required, not 'NoneType'` crash. Now fails with a descriptive `ValueError` that
-  the FETCH handler catches and recovers from; the subsequent UPDATE event delivers the mail
-  with complete fields.
+**Zmiany w `api.py`**:
+- `CalendarEvent` — nowe pole `recurrence_id: Optional[datetime]`
+- `_decrypt_calendar_event` — odczytuje pole `1320` (`recurrenceId`, encrypted date)
+
+**Zmiany w `caldav_server.py`**:
+- `_event_to_vevent` — emituje `RECURRENCE-ID` z prawidłowym formatem
+- `events_to_ical` — buduje `uid_to_tz` i `uid_to_override_ms`
+- EXDATE w masterze filtrowany z dat które mają override (RFC 5545 §3.8.5.1)
+
+**Naprawione bugi**:
+1. EXDATE + RECURRENCE-ID konflikt — nie emitujemy EXDATE dla dat z override
+2. Błąd timezone przy porównaniu ms — `replace(tzinfo=utc)` przed `timestamp()`
 
 ---
 
-## [1.0.2] — 2026-05-26
+## v1.2.2 — 2026-05-28 (VTIMEZONE w iCal)
 
-### Added
-- **Secure External** — send password-protected encrypted mail to non-Tuta recipients.
-  Add the custom SMTP header `X-Tuta-Password: <password>` in your email client;
-  the proxy encrypts the message using Tuta's Secure External flow (argon2id KDF +
-  ExternalUserService + SecureExternalRecipientKeyData). The recipient receives a link
-  and enters the password on `app.tuta.com` to read the message.
-- `docs/thunderbird-secure-external.png` — screenshot showing how to add the
-  `X-Tuta-Password` header in Thunderbird's compose window.
+Eventy cykliczne z niezerową strefą czasową były eksportowane z `DTSTART;TZID=...`
+bez bloku `VTIMEZONE` — RFC 5545 wymaga VTIMEZONE jeśli używane jest TZID.
 
-### Fixed
-- Secure External: second (and subsequent) messages to the same external recipient
-  previously triggered "invalid mac" in the Tuta portal. Root cause: an exception
-  from `_load_existing_external_user_keys` was caught by the wrong `except` block,
-  causing the proxy to silently create a new external account with fresh random keys
-  on every send. The message was encrypted with the new keys, but the recipient's
-  account still held the old ones.
-- Secure External: notification emails showed the literal `$senderName$` instead of
-  the sender's display name. Fixed by passing `senderNameUnencrypted` (field 552) in
-  `SendDraftService`.
+Nowa funkcja `_vtimezone_block(tz_str)` w `caldav_server.py`:
+- Skanuje bieżący rok godzinowo przez `zoneinfo.ZoneInfo`, wykrywa przejścia DST
+- Emituje komponenty `DAYLIGHT` i `STANDARD` z konkretnymi datami
+- Dla stref bez DST: jeden komponent `STANDARD` z `DTSTART:19700101T000000`
 
 ---
 
-## [1.0.1] — 2026-05-14
+## v1.2.1 — 2026-05-27 (CardDAV batch DELETE)
 
-### Added
-- **TutaCrypt PQ decryption** — Tuta→Tuta messages using the new post-quantum key
-  scheme (X25519 + ML-KEM/Kyber-1024 hybrid) are now fully decryptable. Previously
-  these appeared with scrambled subject and content.
-- **Import from external IMAP accounts** — copy or move messages (with attachments)
-  from Gmail or any other IMAP account into Tuta via IMAP APPEND. Messages land in
-  Inbox as properly encrypted Tuta mail.
-- API version parametrization via environment variables (`TUTA_SYS_VERSION`,
-  `TUTA_TUTANOTA_VERSION`, `TUTA_STORAGE_VERSION`, `TUTA_CLIENT_VERSION`).
-  Update versions without touching the code when Tuta bumps their API.
-- Version mismatch detection: HTTP 412 or model-related 400/500 errors now log a
-  `WARNING` with the current version values and instructions.
+CardBook wysyła DELETE requests równolegle (~6 na raz). Przy bulk delete >100 kontaktów
+CardBook przerywał cykl i czekał na ręczną synchronizację.
+
+**Rozwiązanie**: bufor batcha z timerem 150ms w `carddav_server.py` + `eraseMultiple` w Tucie.
+
+- `delete_contacts_bulk_api()` — `DELETE ?ids=id1,id2,...` (jeden HTTP request)
+- `_DeleteBatch` + timer — zbiera równoległe DELETE, wysyła jeden `eraseMultiple`
+
+**Wynik**: bulk delete 856 kontaktów bez przerw; batche 1–5 kontaktów co ~300ms.
 
 ---
 
-## [1.0.0] — 2026-05-12
+## v1.2.0 — 2026-05-27 (CardDAV — kontakty)
 
-### Added
-- Initial public release.
-- IMAP4rev1 server on `127.0.0.1:1143`: read mail, folder management (create/rename/delete),
-  COPY/MOVE, IDLE push, APPEND (drafts + import), EXPUNGE, read/unread flags.
-- SMTP server on `127.0.0.1:1025`: send mail with attachments, E2E encryption for
-  Tuta→Tuta messages (ECC + ML-KEM/Kyber), standard delivery for external recipients.
-- Docker packaging (`docker/Dockerfile` + `docker/docker-compose.yml`).
-- SQLite cache for folder list and local flags.
+Zaimplementowano pełny serwer CardDAV (RFC 6352). Nowe pliki: `tuta/carddav_server.py`, `run_carddav.py`.
+
+Kluczowe bugi naprawione:
+1. `"852": null` vs `"852": []` — asocjacje ZeroOrOne muszą być `[]`, nie `null`
+2. Pola FINAL przy UPDATE — `_kdfNonce` (1837) i `_ownerKeyVersion` (1394) z `existing_raw`
+3. PersistenceResourcePostReturn — pole `"2"` = nowy elem_id (nie string ani lista)
+4. CardBook "dostępna offline" — bez tej opcji CardBook działa read-only
+5. `current-user-privilege-set` wymagany w PROPFIND depth=1 (nie tylko depth=0)
+6. loadRoot — dwuetapowy przez RootInstance, nie bezpośredni URL
+
+---
+
+## v1.1.0 — 2026-05-27 (IMAP fixes + release)
+
+### Persistent WebSocket watcher (IMAP IDLE)
+
+Root cause: między sesjami IMAP IDLE był 2-3 sekundowy gap bez WebSocket.
+Eventy CREATE w tym oknie były tracone.
+
+Naprawka: background task `_bg_event_watcher` trzyma WebSocket alive przez całą sesję.
+Eventy trafiają do `asyncio.Queue`; IDLE i NOOP drainują z kolejki.
+
+### PQ decaps fix
+
+`dict.get("2045", "")` zwracało `None` gdy klucz istnieje z wartością null
+→ `base64.b64decode(None)` → TypeError.
+
+Naprawka: `pq_msg_b64 = entry.get("2045") or ""`.
+
+---
+
+## v1.0.2 — 2026-05-14 (parametryzacja wersji API)
+
+Wersje modeli odczytywane ze zmiennych środowiskowych:
+- `TUTA_SYS_VERSION` (default: 150)
+- `TUTA_TUTANOTA_VERSION` (default: 108)
+- `TUTA_STORAGE_VERSION` (default: 14)
+- `TUTA_CLIENT_VERSION` (default: 346.260428.0)
+
+`_check_version_mismatch()` — na HTTP 412 lub błąd z "model"/"version" loguje WARNING
+z aktualnymi wersjami i instrukcją co zrobić.
+
+---
+
+## v1.0.1 — 2026-05-14 (Docker + publikacja)
+
+- `run_proxy.py` — IMAP + SMTP w jednej pętli asyncio
+- `docker/Dockerfile` + `docker/docker-compose.yml`
+- Publiczne repo: https://github.com/peix2/tutaproxy-public (AGPL v3)
+
+---
+
+## v1.0.0 — 2026-05-14 (attachments fix)
+
+**Upload blob (v=14 w nagłówkach)**: POST do `blobservice` miał `v=14` w query params
+zamiast w nagłówkach — serwer odrzucał ze statusem 400.
+
+**AttachmentKeyData.file (pole 546) = `[[listId, elemId]]`**: `LIST_ELEMENT_ASSOCIATION_GENERATED One`
+musi być podwójnie opakowane.
+
+---
+
+## v0.9 — 2026-05-12 (poprzedni checkpoint)
+
+Wszystkie funkcje M2 działają w Thunderbirdzie, w tym zarządzanie folderami.
+
+**Naprawione (2026-05-11)**:
+- `v=14` musiało być w nagłówkach HTTP requesta do `blobservice GET`
+- Cache `_get_rfc822()` per elementId — eliminuje wielokrotne pobieranie przy partial fetch
+- Sort UID po CRC32 — Thunderbird wymagał UID rosnących
+
+**Naprawione (2026-05-12)**:
+- CREATE folder — `ZeroOrOne` = `[]` nie `null`
+- Parsowanie odpowiedzi create_folder — `resp.get("457",[[]])[0]`
+- Hierarchia folderów w LIST — rekurencyjne budowanie ścieżki
+- RENAME — dwa osobne endpointy (PUT mailset + PUT mailfolderservice)
+- `entries` (pole 1459) — `LIST_ASSOCIATION One` = `["listId"]` nie `"listId"`
+- Thunderbird DELETE = RENAME do Trash
+
+**Naprawione (2026-05-13) — Drafts**:
+- `_random_custom_id()` — 4 bajty (6 znaków), nie 12
+- IMAP APPEND — Drafts przez `create_draft`, Sent odrzucane
+- Drafts — pole 1309 → MailDetailsDraft (nie blob), format `[[listId, elemId]]`

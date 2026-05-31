@@ -64,6 +64,7 @@ from tuta.smtp_server import SMTPServer
 from tuta.caldav_server import CalDAVServer
 from tuta.carddav_server import CardDAVServer
 from tuta.webdav_server import WebDAVServer
+from tuta.telemetry import startup as telemetry_startup
 
 
 async def main() -> None:
@@ -81,6 +82,8 @@ async def main() -> None:
     webdav_host  = os.environ.get("TUTA_WEBDAV_HOST",  "127.0.0.1")
     webdav_port  = int(os.environ.get("TUTA_WEBDAV_PORT",  "5234"))
     cache_path   = os.environ.get("TUTA_CACHE_PATH",   "/data/tuta_cache.db")
+
+    await telemetry_startup()
 
     imap    = IMAPServer(host=imap_host, port=imap_port, cache_path=cache_path)
     smtp    = SMTPServer(host=smtp_host, port=smtp_port)

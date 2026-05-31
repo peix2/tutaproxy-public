@@ -16,6 +16,8 @@ services:
     environment:
       LOG_LEVEL: INFO
       TZ: Pacific/Auckland
+      # Wyłącz telemetrię (sprawdzanie wersji + liczenie instalacji):
+      # TUTAPROXY_TELEMETRY: "false"
       # Gdy Tuta zbumpuje wersję API, nadpisz tu bez przebudowania obrazu:
       # TUTA_SYS_VERSION: "150"
       # TUTA_TUTANOTA_VERSION: "108"

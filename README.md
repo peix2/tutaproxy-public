@@ -303,6 +303,30 @@ Nadawca = From, Do = To, Temat = Subject).*
 
 ---
 
+## Telemetry
+
+On startup (and then once every 24 hours) tutaproxy sends a single request to the author's server:
+
+```json
+{"id": "a3f2b1c8-d4e5-4f6a-87b8-9c0d1e2f3a4b", "version": "1.3.4"}
+```
+
+- **`id`** — a random UUID generated on first start, stored locally in `/data/.tutaproxy-id`. It is not linked to your Tuta account, email address, password, or any other personal data.
+- **`version`** — the tutaproxy version you are running.
+
+That is all that is sent. Your **IP address is not logged**: the collection server has `access_log off` for this endpoint and strips forwarding headers before the request reaches the application.
+
+The purpose is to estimate the number of active installations and to notify you when a newer version is available — if your version is outdated, a line will appear in the log.
+
+There is no need to trust me — you can always verify the code, and please do so so we're all happy :-)
+
+To **opt out**, set in your `.env` or `docker-compose.yml`:
+```
+TUTAPROXY_TELEMETRY=false
+```
+
+---
+
 ## How it works
 
 ```
