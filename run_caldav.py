@@ -19,6 +19,7 @@ Konfiguracja Thunderbirda (Lightning):
 
 import asyncio
 import logging
+import logging.handlers
 import os
 import sys
 
@@ -29,12 +30,18 @@ except ImportError:
     pass
 
 # Konfiguracja logowania
-log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
-log_file  = os.environ.get("LOG_FILE", "")
+log_level        = os.environ.get("LOG_LEVEL", "INFO").upper()
+log_file         = os.environ.get("LOG_FILE", "")
+log_rotate_bytes = int(os.environ.get("LOG_ROTATE_BYTES", str(50 * 1024 * 1024)))
+log_rotate_count = int(os.environ.get("LOG_ROTATE_COUNT", "5"))
 
 handlers = []
 if log_file:
-    handlers.append(logging.FileHandler(log_file))
+    handlers.append(
+        logging.handlers.RotatingFileHandler(
+            log_file, maxBytes=log_rotate_bytes, backupCount=log_rotate_count, encoding="utf-8"
+        )
+    )
 else:
     handlers.append(logging.StreamHandler(sys.stderr))
 

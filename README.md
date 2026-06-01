@@ -93,6 +93,9 @@ python run_webdav.py
 | `TUTA_WEBDAV_PORT` | `5234` | WebDAV port |
 | `TUTA_CACHE_PATH` | `tuta_cache.db` | SQLite cache file path |
 | `LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR` |
+| `LOG_FILE` | *(stderr)* | Path to log file; if set, logs go to file instead of stderr |
+| `LOG_ROTATE_BYTES` | `52428800` (50 MB) | Max log file size before rotation |
+| `LOG_ROTATE_COUNT` | `5` | Number of rotated backup files to keep |
 | `TUTA_SYS_VERSION` | `150` | Tuta sys model version (override after API update) |
 | `TUTA_TUTANOTA_VERSION` | `108` | Tuta tutanota model version |
 | `TUTA_STORAGE_VERSION` | `14` | Tuta storage model version |

@@ -14,6 +14,7 @@ Konfiguracja przez zmienne środowiskowe lub plik .env (opcjonalne):
 
 import asyncio
 import logging
+import logging.handlers
 import os
 import sys
 
@@ -39,13 +40,19 @@ def _load_dotenv(path: str = ".env") -> None:
 
 _load_dotenv()
 
-LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
-LOG_FILE = os.environ.get("LOG_FILE", "")
+LOG_LEVEL        = os.environ.get("LOG_LEVEL", "INFO").upper()
+LOG_FILE         = os.environ.get("LOG_FILE", "")
+LOG_ROTATE_BYTES = int(os.environ.get("LOG_ROTATE_BYTES", str(50 * 1024 * 1024)))
+LOG_ROTATE_COUNT = int(os.environ.get("LOG_ROTATE_COUNT", "5"))
 
 # Jeśli LOG_FILE ustawiony — tylko plik (stderr przekierowany do tego samego
 # pliku przez shell powoduje podwójne wpisy).
 if LOG_FILE:
-    log_handlers: list[logging.Handler] = [logging.FileHandler(LOG_FILE, encoding="utf-8")]
+    log_handlers: list[logging.Handler] = [
+        logging.handlers.RotatingFileHandler(
+            LOG_FILE, maxBytes=LOG_ROTATE_BYTES, backupCount=LOG_ROTATE_COUNT, encoding="utf-8"
+        )
+    ]
 else:
     log_handlers = [logging.StreamHandler(sys.stderr)]
 

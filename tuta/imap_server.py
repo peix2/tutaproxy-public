@@ -1656,16 +1656,21 @@ class IMAPConnection:
                     bool(mail_raw.get("_answered")),
                 )
 
+        # Mapa elem_id → mail_raw — O(1) lookup zamiast O(N×M) przy aktualizacji stanu lokalnego
+        by_elem_id = {
+            mr["99"][1]: mr
+            for mr in self.mailbox.messages
+            if isinstance(mr.get("99"), list) and len(mr["99"]) > 1
+        }
+
         # Wywołania API dla \Seen
         if mark_seen:
             try:
                 await self.client.mark_mails_unread(self.session, mark_seen, unread=False)
-                # Aktualizuj stan lokalny żeby FETCH FLAGS był spójny
                 for lid, eid in mark_seen:
-                    for mr in self.mailbox.messages:
-                        mid = mr.get("99", ["", ""])
-                        if (isinstance(mid, list) and len(mid) > 1 and mid[1] == eid):
-                            mr["109"] = "0"  # unread=false
+                    mr = by_elem_id.get(eid)
+                    if mr:
+                        mr["109"] = "0"  # unread=false
             except TutaAPIError as e:
                 logger.warning(f"[{self.peer}] STORE mark_seen failed: {e}")
 
@@ -1673,10 +1678,9 @@ class IMAPConnection:
             try:
                 await self.client.mark_mails_unread(self.session, mark_unseen, unread=True)
                 for lid, eid in mark_unseen:
-                    for mr in self.mailbox.messages:
-                        mid = mr.get("99", ["", ""])
-                        if (isinstance(mid, list) and len(mid) > 1 and mid[1] == eid):
-                            mr["109"] = "1"  # unread=true
+                    mr = by_elem_id.get(eid)
+                    if mr:
+                        mr["109"] = "1"  # unread=true
             except TutaAPIError as e:
                 logger.warning(f"[{self.peer}] STORE mark_unseen failed: {e}")
 
