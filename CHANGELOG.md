@@ -1,5 +1,60 @@
 # Changelog
 
+## v1.3.7 — 2026-06-11 — HMAC strict mode + stability fixes
+
+### Security — HMAC verification now strict
+
+`aes_decrypt_tuta` previously logged a warning on HMAC mismatch but continued
+decrypting (warn-only mode, introduced in v1.3.2 to avoid regressions on unknown
+legacy ciphertext formats). After 13 days of production use with zero HMAC
+warnings, the mode has been switched to **strict**: a mismatch now raises
+`ValueError` and aborts decryption.
+
+If you ever hit a regression on unusual data, set `TUTA_SKIP_HMAC=1` as a
+kill-switch — this restores the old warn-only behaviour.
+
+File: `tuta/crypto.py`.
+
+### Cleanup — removed dead bcrypt fallback code
+
+`_verifier_bcrypt` contained a try/except that fell back to `passlib` when the
+`bcrypt` package was not installed. The passlib path had a bug (it passed
+`pw_hash.hex()` instead of the raw bytes, so the resulting verifier was always
+wrong — login would always fail). Since `bcrypt` has been a hard requirement
+since day one, the fallback was never reachable in a correct installation.
+
+Removed `_verifier_bcrypt_passlib` and the surrounding try/except. A missing
+`bcrypt` package now raises a clear `RuntimeError: bcrypt is required: pip install bcrypt`.
+
+File: `tuta/crypto.py`.
+
+### Fix — WebSocket reconnect exponential backoff
+
+The persistent WebSocket event watcher in the IMAP server reconnected after a
+fixed delay: 2 s on a clean close, 5 s on an exception. If the Tuta server
+returned a persistent error (e.g. an API version mismatch), the watcher
+hammered the server with reconnect attempts every few seconds.
+
+Replaced with exponential backoff: 2 → 4 → 8 → … → 60 s (maximum). The delay
+resets to 2 s after any successful stream of events.
+
+File: `tuta/imap_server.py`.
+
+### Fix — version mismatch detection based on HTTP status only
+
+`_check_version_mismatch` logged a "possible API version mismatch" warning
+whenever certain keywords (`"model"`, `"version"`, `"outdated"`, `"incompatible"`)
+appeared in any error response body. This was both noisy (false positives on
+unrelated errors) and fragile (false negatives when Tuta changes its error
+messages).
+
+Tuta's documented status for a model version conflict is **HTTP 412 Precondition
+Failed**. The check now triggers only on 412.
+
+File: `tuta/api.py`.
+
+---
+
 ## v1.3.6 — 2026-06-01 — IMAP STORE performance + log rotation
 
 ### Performance — IMAP STORE O(N×M) → O(1)

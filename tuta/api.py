@@ -189,14 +189,8 @@ class TutaClient:
 
     @staticmethod
     def _check_version_mismatch(status: int, body: str) -> None:
-        """Loguje ostrzeżenie jeśli błąd wygląda na niezgodność wersji modelu API."""
-        is_mismatch = (
-            status == 412
-            or (status in (400, 500) and any(
-                kw in body.lower() for kw in ("model", "version", "outdated", "incompatible")
-            ))
-        )
-        if is_mismatch:
+        """Loguje ostrzeżenie przy HTTP 412 — Tuta zwraca to dla niezgodności wersji modelu."""
+        if status == 412:
             logger.warning(
                 "Możliwa niezgodność wersji API Tuty (HTTP %d). "
                 "Aktualne wersje: sys=%s tutanota=%s storage=%s client=%s. "

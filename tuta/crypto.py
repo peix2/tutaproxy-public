@@ -118,15 +118,7 @@ def _verifier_bcrypt(password: str, salt: bytes) -> str:
     try:
         import bcrypt as _bcrypt
     except ImportError:
-        try:
-            # passlib jako alternatywa (zainstalowana przez mitmproxy)
-            from passlib.hash import bcrypt as _passlib_bcrypt
-            return _verifier_bcrypt_passlib(password, salt, _passlib_bcrypt)
-        except ImportError:
-            raise RuntimeError(
-                "Brak biblioteki bcrypt. Zainstaluj: pip install bcrypt\n"
-                "lub: pip install passlib[bcrypt]"
-            )
+        raise RuntimeError("bcrypt jest wymagany: pip install bcrypt")
 
     # Krok 1: SHA256 hasła
     pw_hash = hashlib.sha256(password.encode("utf-8")).digest()
@@ -141,19 +133,6 @@ def _verifier_bcrypt(password: str, salt: bytes) -> str:
 
     # Krok 3: SHA256 wyniku bcrypt → base64url
     final_hash = hashlib.sha256(bcrypt_result).digest()
-    return b64url_encode(final_hash)
-
-
-def _verifier_bcrypt_passlib(password: str, salt: bytes, passlib_bcrypt) -> str:
-    """Verifier przez passlib (fallback gdy nie ma bcrypt)."""
-    pw_hash = hashlib.sha256(password.encode("utf-8")).digest()
-    bcrypt_salt_str = _make_bcrypt_salt(salt)
-
-    # passlib używa innego API
-    result = passlib_bcrypt.using(rounds=8, salt=bcrypt_salt_str[7:]).hash(
-        pw_hash.hex()  # passlib może wymagać stringa
-    )
-    final_hash = hashlib.sha256(result.encode("utf-8")).digest()
     return b64url_encode(final_hash)
 
 
@@ -365,11 +344,8 @@ def aes_decrypt_tuta(key: bytes, enc_data: bytes) -> bytes:
     Format: [0x01][IV 16B][ciphertext][HMAC-SHA256 32B]
     deriveSubKeys: SHA512(key) → enc_key(32B) + hmac_key(32B)
 
-    Weryfikacja HMAC: tryb warn-only — przy niezgodności loguje WARNING,
-    ale i tak deszyfruje. Pozwala obserwować tampering / niespójność formatu
-    bez ryzyka regresji na legacy danych. Po okresie obserwacji bez warningów
-    najlepszym kolejnym krokiem jest tryb strict z opt-out przez ENV
-    TUTA_SKIP_HMAC=1 — wówczas mismatch będzie rzucał ValueError.
+    Weryfikacja HMAC: tryb strict — mismatch rzuca ValueError.
+    Kill-switch: ustaw TUTA_SKIP_HMAC=1 aby pominąć (loguje WARNING).
 
     Używane do odszyfrowywania:
       - mail_group_key z membership['27'] (kluczem user_group_key)
@@ -391,14 +367,18 @@ def aes_decrypt_tuta(key: bytes, enc_data: bytes) -> bytes:
     # HMAC liczone nad IV + ciphertext (bez version byte — zgodnie z aes_encrypt_tuta).
     expected_mac = _hmac.new(hmac_key, iv + ciphertext, hashlib.sha256).digest()
     if not _hmac.compare_digest(expected_mac, received_mac):
-        # warn-only: loguj, ale nie blokuj — chronimy się przed potencjalną regresją
-        # na nietypowych danych z Tuty. Loguje key fingerprint (nie sam klucz) i długość
-        # do diagnostyki, bez ujawniania materiału kryptograficznego.
         key_fp = hashlib.sha256(key).hexdigest()[:8]
-        logger.warning(
-            "aes_decrypt_tuta: HMAC mismatch — kontynuuję deszyfrowanie "
-            "(warn-only). key_fp=%s len=%d", key_fp, len(enc_data),
-        )
+        if os.environ.get("TUTA_SKIP_HMAC") == "1":
+            logger.warning(
+                "aes_decrypt_tuta: HMAC mismatch (TUTA_SKIP_HMAC=1, pomijam). "
+                "key_fp=%s len=%d", key_fp, len(enc_data),
+            )
+        else:
+            raise ValueError(
+                f"aes_decrypt_tuta: HMAC mismatch — weryfikacja integralności nie powiodła się. "
+                f"key_fp={key_fp} len={len(enc_data)}. "
+                f"Ustaw TUTA_SKIP_HMAC=1 aby pominąć weryfikację."
+            )
 
     cipher = Cipher(algorithms.AES(enc_key), modes.CBC(iv))
     raw = cipher.decryptor().update(ciphertext) + b""

@@ -1822,17 +1822,21 @@ class IMAPConnection:
         """Łączy się z WebSocket Tuty i buforuje eventy w _event_queue.
         Automatycznie reconnectuje po zamknięciu połączenia — nigdy nie przerywa
         między sesjami IDLE, więc żaden CREATE event nie jest tracony."""
+        backoff = 2
         while self.session and self.state not in ("LOGOUT", "NOT_AUTH"):
             try:
                 async for event in self.client.iter_event_stream(self.session):
+                    backoff = 2  # reset po udanym strumieniu eventów
                     await self._event_queue.put(event)
-                logger.debug("[%s] event watcher: WS zamknięty, reconnect za 2s", self.peer)
-                await asyncio.sleep(2)
+                logger.debug("[%s] event watcher: WS zamknięty, reconnect za %ds", self.peer, backoff)
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 60)
             except asyncio.CancelledError:
                 return
             except Exception as e:
-                logger.warning("[%s] event watcher error: %s, reconnect za 5s", self.peer, e)
-                await asyncio.sleep(5)
+                logger.warning("[%s] event watcher error: %s, reconnect za %ds", self.peer, e, backoff)
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 60)
         logger.debug("[%s] event watcher: sesja zakończona", self.peer)
 
     async def _process_ws_event(self, event: dict) -> None:
