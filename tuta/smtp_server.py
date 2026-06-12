@@ -16,17 +16,24 @@ Uwierzytelnienie: AUTH PLAIN lub AUTH LOGIN.
 """
 
 import asyncio
+import hashlib
+import hmac
 import html
 import logging
+import time
 from email import message_from_bytes
 from email.header import decode_header, make_header
 from email.utils import getaddresses
 
 from aiosmtpd.smtp import SMTP as SMTPProtocol, AuthResult, LoginPassword
 
-from .api import TutaClient, TutaAPIError
+from .api import Session, TutaClient, TutaAPIError
 
 logger = logging.getLogger(__name__)
+
+# TTL cache sesji SMTP. Token Tuty żyje godzinami; krótki TTL ogranicza okno,
+# w którym sesja siedzi w pamięci, i wymusza okresowy świeży login.
+_SMTP_SESSION_TTL = 300  # 5 min
 
 
 def _decode_header(value: str | None) -> str:
@@ -107,6 +114,62 @@ class _TutaSMTPHandler:
 
     def __init__(self, client: TutaClient):
         self.client = client
+        # Cache sesji: email → (session, sha256(pw), monotonic_ts). Bez tego każdy
+        # mail = pełny login (argon2id m=32MB,t=4 + handshake do Tuty); kolejka N maili
+        # = N× argon2 → procesor leży. Porównanie sha256(pw) w czasie stałym chroni
+        # przed auth bypass (jak w DAV). Reużycie tylko w obrębie _SMTP_SESSION_TTL.
+        self._sessions: dict[str, tuple[Session, bytes, float]] = {}
+        # Blokada per-email — drugi równoległy mail tego usera czeka zamiast logować drugi raz.
+        self._login_locks: dict[str, asyncio.Lock] = {}
+
+    async def _get_session(self, email: str, password: str) -> Session:
+        """Zalogowana sesja dla (email, password) z cache. Reużywa w obrębie TTL gdy
+        sha256(hasła) się zgadza; inaczej świeży login. Porównanie stałoczasowe
+        zapobiega auth bypass (cache nie zwróci sesji dla innego hasła)."""
+        pw_hash = hashlib.sha256(password.encode("utf-8")).digest()
+        cached = self._sessions.get(email)
+        if cached and hmac.compare_digest(cached[1], pw_hash) \
+                and (time.monotonic() - cached[2]) < _SMTP_SESSION_TTL:
+            return cached[0]
+        # Blokada per-email: drugi równoległy request czeka zamiast logować się drugi raz
+        lock = self._login_locks.setdefault(email, asyncio.Lock())
+        async with lock:
+            # Ponowne sprawdzenie pod blokadą — inny coroutine mógł właśnie zalogować
+            cached = self._sessions.get(email)
+            if cached and hmac.compare_digest(cached[1], pw_hash) \
+                    and (time.monotonic() - cached[2]) < _SMTP_SESSION_TTL:
+                return cached[0]
+            # Stara sesja (inne hasło lub wygasły TTL) — wyloguj przed podmianą,
+            # żeby nie akumulować aktywnych sesji w UI Tuty.
+            old = self._sessions.pop(email, None)
+            if old:
+                await self._logout_session(email, old[0])
+            session = await self.client.login(email, password)
+            self._sessions[email] = (session, pw_hash, time.monotonic())
+            logger.info("SMTP: zalogowano %s (cache, TTL %ds)", email, _SMTP_SESSION_TTL)
+            return session
+
+    async def _logout_session(self, email: str, session: Session) -> None:
+        """Best-effort DELETE /sys/session — błąd ignorowany (token mógł już wygasnąć)."""
+        try:
+            await self.client.logout(session)
+        except Exception as exc:
+            logger.debug("SMTP: logout %s zignorowany: %s", email, exc)
+
+    async def _invalidate_session(self, email: str) -> None:
+        """Usuwa sesję z cache (po 401/440 podczas wysyłki) + best-effort logout."""
+        old = self._sessions.pop(email, None)
+        if old:
+            await self._logout_session(email, old[0])
+
+    async def logout_all(self) -> None:
+        """Graceful logout wszystkich sesji z cache — wołane przy shutdown serwera."""
+        if not self._sessions:
+            return
+        logger.info("SMTP: graceful logout %d sesji", len(self._sessions))
+        for email, (session, _, _) in list(self._sessions.items()):
+            await self._logout_session(email, session)
+        self._sessions.clear()
 
     async def handle_DATA(self, server, session, envelope) -> str:
         email_addr = getattr(session, "tuta_email", None)
@@ -144,134 +207,158 @@ class _TutaSMTPHandler:
             f"attachments={len(mime_attachments)} secure_external={secure_password is not None}"
         )
 
-        tuta_session = None
-        try:
-            tuta_session = await self.client.login(email_addr, password)
-            mail_group_key = await self.client.get_mail_group_key(tuta_session)
+        parsed = {
+            "subject": subject,
+            "from_addr": from_addr,
+            "from_name": from_name,
+            "to_list": to_list,
+            "cc_list": cc_list,
+            "bcc_list": bcc_list,
+            "body_html": body_html,
+            "mime_attachments": mime_attachments,
+            "secure_password": secure_password,
+        }
+        # Cache sesji: sesja reużywana między mailami w obrębie TTL. Przy 401/440
+        # (sesja wygasła po stronie Tuty) invalidate + jeden retry ze świeżym loginem.
+        for attempt in (1, 2):
+            try:
+                tuta_session = await self._get_session(email_addr, password)
+                await self._send_message(tuta_session, parsed)
+                return "250 2.0.0 OK: Message accepted"
+            except TutaAPIError as e:
+                if e.status_code in (401, 440) and attempt == 1:
+                    logger.info("SMTP: %s podczas wysyłki dla %s — invalidate + retry",
+                                e.status_code, email_addr)
+                    await self._invalidate_session(email_addr)
+                    continue
+                logger.error(f"SMTP send failed: {e}")
+                return f"554 5.0.0 Send failed: {e}"
+            except Exception as e:
+                logger.exception(f"SMTP unexpected error: {e}")
+                return "451 4.0.0 Internal error"
+        return "451 4.0.0 Internal error"
 
-            all_addresses = [a for _, a in (to_list + cc_list + bcc_list)]
+    async def _send_message(self, tuta_session: Session, p: dict) -> None:
+        """Wysyłka draftu w już zalogowanej (cache) sesji: upload załączników →
+        create_draft → send_draft (E2E / Secure External / non-confidential).
+        Rzuca TutaAPIError do wołającego — retry/invalidate obsługuje handle_DATA."""
+        subject = p["subject"]
+        from_addr = p["from_addr"]
+        from_name = p["from_name"]
+        to_list = p["to_list"]
+        cc_list = p["cc_list"]
+        bcc_list = p["bcc_list"]
+        body_html = p["body_html"]
+        mime_attachments = p["mime_attachments"]
+        secure_password = p["secure_password"]
 
-            # Secure External — gdy ustawiony X-Tuta-Password i wszyscy odbiorcy zewnętrzni
-            if secure_password is not None:
-                recipient_keys_check = {}
-                has_tuta_recipients = False
-                for addr in all_addresses:
-                    pub_key = await self.client.get_recipient_public_key(addr, tuta_session.access_token)
-                    if pub_key is not None:
-                        has_tuta_recipients = True
-                        break
+        mail_group_key = await self.client.get_mail_group_key(tuta_session)
 
-                if has_tuta_recipients:
-                    logger.warning(
-                        "X-Tuta-Password ustawiony, ale wśród odbiorców są konta Tuta — "
-                        "Secure External wymaga wyłącznie odbiorców zewnętrznych. Fallback: non-confidential."
-                    )
-                    secure_password = None
-                else:
-                    logger.info(f"SMTP send: Secure External recipients={all_addresses}")
+        all_addresses = [a for _, a in (to_list + cc_list + bcc_list)]
 
-            # Sprawdź E2E (Tuta→Tuta) — tylko gdy nie Secure External
-            recipient_keys: dict[str, dict] = {}
-            is_e2e = False
-            if secure_password is None:
-                is_e2e = True
-                for addr in all_addresses:
-                    pub_key = await self.client.get_recipient_public_key(addr, tuta_session.access_token)
-                    if pub_key is None:
-                        is_e2e = False
-                        break
-                    recipient_keys[addr] = pub_key
-                logger.info(f"SMTP send: E2E={'tak' if is_e2e else 'nie'} recipients={all_addresses}")
+        # Secure External — gdy ustawiony X-Tuta-Password i wszyscy odbiorcy zewnętrzni
+        if secure_password is not None:
+            has_tuta_recipients = False
+            for addr in all_addresses:
+                pub_key = await self.client.get_recipient_public_key(addr, tuta_session.access_token)
+                if pub_key is not None:
+                    has_tuta_recipients = True
+                    break
 
-            # confidential=True przy E2E lub Secure External (wymagane przez API)
-            is_confidential = is_e2e or (secure_password is not None)
-
-            # Upload załączników przed tworzeniem draftu
-            draft_attachments: list[dict] = []
-            file_session_keys: list[bytes] = []
-            for att_data, att_filename, att_mime, att_cid in mime_attachments:
-                draft_att, file_sk = await self.client.upload_attachment(
-                    tuta_session, mail_group_key, att_data, att_filename, att_mime, att_cid
+            if has_tuta_recipients:
+                logger.warning(
+                    "X-Tuta-Password ustawiony, ale wśród odbiorców są konta Tuta — "
+                    "Secure External wymaga wyłącznie odbiorców zewnętrznych. Fallback: non-confidential."
                 )
-                draft_attachments.append(draft_att)
-                file_session_keys.append(file_sk)
-                logger.debug(f"SMTP: załącznik upload OK: {att_filename!r} {len(att_data)}B")
-
-            draft_list_id, draft_elem_id, sk = await self.client.create_draft(
-                session=tuta_session,
-                subject=subject,
-                body_html=body_html,
-                from_addr=from_addr,
-                from_name=from_name,
-                to_recipients=to_list,
-                cc_recipients=cc_list,
-                bcc_recipients=bcc_list,
-                mail_group_key=mail_group_key,
-                confidential=is_confidential,
-                attachments=draft_attachments,
-            )
-
-            # Pobierz ID plików przypisane przez serwer (pole 115 w Mail)
-            attachment_keys: list[tuple[str, str, bytes]] = []
-            if draft_attachments:
-                file_ids = await self.client.get_draft_file_ids(
-                    tuta_session, draft_list_id, draft_elem_id
-                )
-                for i, file_sk in enumerate(file_session_keys):
-                    if i < len(file_ids):
-                        attachment_keys.append((file_ids[i][0], file_ids[i][1], file_sk))
-
-            if secure_password is not None:
-                recipients_with_pw = [(addr, secure_password) for addr in all_addresses]
-                await self.client.send_draft_secure_external(
-                    session=tuta_session,
-                    draft_list_id=draft_list_id,
-                    draft_elem_id=draft_elem_id,
-                    session_key=sk,
-                    mail_group_key=mail_group_key,
-                    recipients=recipients_with_pw,
-                    attachment_keys=attachment_keys,
-                    sender_name=from_name,
-                )
-            elif is_e2e:
-                sender_priv, sender_pub, sender_ver = await self.client.get_sender_ecc_keypair(tuta_session)
-                recipients_with_keys = [(a, recipient_keys[a]) for a in all_addresses]
-                await self.client.send_draft_e2e(
-                    session=tuta_session,
-                    draft_list_id=draft_list_id,
-                    draft_elem_id=draft_elem_id,
-                    session_key=sk,
-                    recipients=recipients_with_keys,
-                    sender_ecc_priv=sender_priv,
-                    sender_ecc_pub=sender_pub,
-                    sender_key_version=sender_ver,
-                    attachment_keys=attachment_keys,
-                )
+                secure_password = None
             else:
-                await self.client.send_draft(
-                    session=tuta_session,
-                    draft_list_id=draft_list_id,
-                    draft_elem_id=draft_elem_id,
-                    session_key=sk,
-                    attachment_keys=attachment_keys,
-                )
+                logger.info(f"SMTP send: Secure External recipients={all_addresses}")
 
-        except TutaAPIError as e:
-            logger.error(f"SMTP send failed: {e}")
-            return f"554 5.0.0 Send failed: {e}"
-        except Exception as e:
-            logger.exception(f"SMTP unexpected error: {e}")
-            return "451 4.0.0 Internal error"
-        finally:
-            # SMTP loguje świeżą sesję per request — natychmiastowy logout zapobiega
-            # akumulacji "active sessions" w UI Tuty (token TTL to wiele godzin).
-            if tuta_session is not None:
-                try:
-                    await self.client.logout(tuta_session)
-                except Exception as exc:
-                    logger.debug("SMTP: logout zignorowany: %s", exc)
+        # Sprawdź E2E (Tuta→Tuta) — tylko gdy nie Secure External
+        recipient_keys: dict[str, dict] = {}
+        is_e2e = False
+        if secure_password is None:
+            is_e2e = True
+            for addr in all_addresses:
+                pub_key = await self.client.get_recipient_public_key(addr, tuta_session.access_token)
+                if pub_key is None:
+                    is_e2e = False
+                    break
+                recipient_keys[addr] = pub_key
+            logger.info(f"SMTP send: E2E={'tak' if is_e2e else 'nie'} recipients={all_addresses}")
 
-        return "250 2.0.0 OK: Message accepted"
+        # confidential=True przy E2E lub Secure External (wymagane przez API)
+        is_confidential = is_e2e or (secure_password is not None)
+
+        # Upload załączników przed tworzeniem draftu
+        draft_attachments: list[dict] = []
+        file_session_keys: list[bytes] = []
+        for att_data, att_filename, att_mime, att_cid in mime_attachments:
+            draft_att, file_sk = await self.client.upload_attachment(
+                tuta_session, mail_group_key, att_data, att_filename, att_mime, att_cid
+            )
+            draft_attachments.append(draft_att)
+            file_session_keys.append(file_sk)
+            logger.debug(f"SMTP: załącznik upload OK: {att_filename!r} {len(att_data)}B")
+
+        draft_list_id, draft_elem_id, sk = await self.client.create_draft(
+            session=tuta_session,
+            subject=subject,
+            body_html=body_html,
+            from_addr=from_addr,
+            from_name=from_name,
+            to_recipients=to_list,
+            cc_recipients=cc_list,
+            bcc_recipients=bcc_list,
+            mail_group_key=mail_group_key,
+            confidential=is_confidential,
+            attachments=draft_attachments,
+        )
+
+        # Pobierz ID plików przypisane przez serwer (pole 115 w Mail)
+        attachment_keys: list[tuple[str, str, bytes]] = []
+        if draft_attachments:
+            file_ids = await self.client.get_draft_file_ids(
+                tuta_session, draft_list_id, draft_elem_id
+            )
+            for i, file_sk in enumerate(file_session_keys):
+                if i < len(file_ids):
+                    attachment_keys.append((file_ids[i][0], file_ids[i][1], file_sk))
+
+        if secure_password is not None:
+            recipients_with_pw = [(addr, secure_password) for addr in all_addresses]
+            await self.client.send_draft_secure_external(
+                session=tuta_session,
+                draft_list_id=draft_list_id,
+                draft_elem_id=draft_elem_id,
+                session_key=sk,
+                mail_group_key=mail_group_key,
+                recipients=recipients_with_pw,
+                attachment_keys=attachment_keys,
+                sender_name=from_name,
+            )
+        elif is_e2e:
+            sender_priv, sender_pub, sender_ver = await self.client.get_sender_ecc_keypair(tuta_session)
+            recipients_with_keys = [(a, recipient_keys[a]) for a in all_addresses]
+            await self.client.send_draft_e2e(
+                session=tuta_session,
+                draft_list_id=draft_list_id,
+                draft_elem_id=draft_elem_id,
+                session_key=sk,
+                recipients=recipients_with_keys,
+                sender_ecc_priv=sender_priv,
+                sender_ecc_pub=sender_pub,
+                sender_key_version=sender_ver,
+                attachment_keys=attachment_keys,
+            )
+        else:
+            await self.client.send_draft(
+                session=tuta_session,
+                draft_list_id=draft_list_id,
+                draft_elem_id=draft_elem_id,
+                session_key=sk,
+                attachment_keys=attachment_keys,
+            )
 
 
 def _make_authenticator():
@@ -296,12 +383,14 @@ class SMTPServer:
         self.port = port
         self._client: TutaClient | None = None
         self._server: asyncio.AbstractServer | None = None
+        self._handler: "_TutaSMTPHandler | None" = None
 
     async def start(self):
         self._client = TutaClient()
         await self._client.__aenter__()
 
         handler = _TutaSMTPHandler(self._client)
+        self._handler = handler
         authenticator = _make_authenticator()
 
         def smtp_factory():
@@ -320,15 +409,17 @@ class SMTPServer:
         await self._server.serve_forever()
 
     async def stop(self):
-        """Graceful shutdown — listener jest zamykany, klient aiohttp też.
-        SMTP nie trzyma cache sesji (logout per request w handle_DATA), więc
-        nie ma osobnych sesji do wylogowania tutaj."""
+        """Graceful shutdown — listener zamykany, cache sesji wylogowany, klient
+        aiohttp domknięty. Handler trzyma cache sesji SMTP (TTL), więc logout_all
+        zamyka aktywne sesje, żeby nie zostawały w UI Tuty."""
         if self._server:
             self._server.close()
             try:
                 await self._server.wait_closed()
             except Exception as exc:
                 logger.debug("SMTP: wait_closed: %s", exc)
+        if self._handler:
+            await self._handler.logout_all()
         if self._client:
             await self._client.__aexit__(None, None, None)
         logger.info("SMTP: shutdown OK")

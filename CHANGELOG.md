@@ -1,5 +1,33 @@
 # Changelog
 
+## v1.3.9 — 2026-06-12 — SMTP: session cache (login reused across messages)
+
+SMTP logged in a fresh session for **every** message (full argon2id m=32MB,t=4 +
+handshake to Tuta) and logged out immediately. A queue of N messages = N× argon2 →
+CPU pegged, an easy DoS and poor throughput on bursts.
+
+### SMTP session cache (`tuta/smtp_server.py`)
+
+The handler now keeps `dict[email] → (session, sha256(pw), monotonic_ts)`, modeled
+on the DAV cache:
+
+- Session reused across messages within a TTL (`_SMTP_SESSION_TTL = 300s`). The Tuta
+  token lives for hours; a short TTL limits how long a session sits in memory and
+  forces a periodic fresh login.
+- Constant-time `hmac.compare_digest(sha256(pw))` — the cache never returns a session
+  for a different password (auth-bypass guard).
+- Per-email `asyncio.Lock` — concurrent messages from the same user wait instead of
+  logging in twice; double-checked under the lock.
+- An old session (different password / expired TTL) is logged out before replacement,
+  so active sessions don't pile up in the Tuta UI.
+- On `401`/`440` during send (session expired server-side): invalidate + one retry
+  with a fresh login.
+- Logout moved from per-message to TTL/shutdown: `SMTPServer.stop()` calls
+  `logout_all()` (graceful logout of all cached sessions).
+
+The send logic was extracted from `handle_DATA` into `_send_message()` (attachment
+upload → create_draft → send_draft: E2E / Secure External / non-confidential).
+
 ## v1.3.8 — 2026-06-12 — Security: fail closed on key errors, telemetry without mTLS
 
 Security review of the Tuta-facing communication. Three classes of fixes in
