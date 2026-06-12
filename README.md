@@ -302,6 +302,7 @@ Nadawca = From, Do = To, Temat = Subject).*
 - For each CalDAV/CardDAV/WebDAV request the proxy compares `sha256(password)` against the cached session hash in constant time; a cached session is reused only when the hash matches.
 - All actual email data is fetched from Tuta's servers over HTTPS. Decryption happens in the proxy process on your machine.
 - The proxy verifies the HMAC tag on Tuta's AesCbcThenHmac ciphertexts. As of v1.3.7 this is **strict**: a mismatch raises an error and aborts decryption. If you hit a regression on unusual data, set `TUTA_SKIP_HMAC=1` to fall back to warn-only mode.
+- As of v1.3.8 the key-loading path **fails closed**: if your user/group key cannot be loaded or decrypted, login aborts with an error instead of falling back to an all-zero placeholder key. Debug logs also no longer print key material (only lengths).
 - Sessions are torn down gracefully on shutdown (since v1.3.3): `SIGTERM`/`SIGINT` triggers a `DELETE /sys/session` for every cached IMAP/CalDAV/CardDAV/WebDAV session, and SMTP logs out after each send. Without this, Tuta's "Active sessions" list would accumulate stale entries until the token TTL expired (hours).
 
 ---
@@ -318,6 +319,8 @@ On startup (and then once every 24 hours) tutaproxy sends a single request to th
 - **`version`** — the tutaproxy version you are running.
 
 That is all that is sent. Your **IP address is not logged**: the collection server has `access_log off` for this endpoint and strips forwarding headers before the request reaches the application.
+
+The connection is plain TLS. The client pins the collection server against a CA certificate bundled in the repo (`tuta/certs/ca.crt`) — so it only talks to the intended server. There is no client certificate: in an open-source project a shipped client key would be public anyway and provide no real authentication, so as of v1.3.8 the client authenticates the server only (server pinning), and abuse is handled by rate limiting on the server side.
 
 The purpose is to estimate the number of active installations and to notify you when a newer version is available — if your version is outdated, a line will appear in the log.
 

@@ -258,7 +258,8 @@ class TutaClient:
 
         # Krok 1 — salt
         salt_url = self._url("sys", "saltservice")
-        params = {"_body": f'{{"418":"0","419":"{email}"}}'}
+        # json.dumps escapuje email — bez tego znak " w adresie rozbija strukturę żądania
+        params = {"_body": json.dumps({"418": "0", "419": email})}
         salt_resp = await self._get(salt_url, params=params)
 
         # Pole 2133 = kdfType: "0"=bcrypt, "1"=argon2id
@@ -266,11 +267,10 @@ class TutaClient:
         kdf_version = int(salt_resp.get("2133", salt_resp.get("421", "0")))
         salt_b64 = salt_resp.get("422", "")
         salt = base64.b64decode(salt_b64)
-        logger.debug(f"kdfVersion={kdf_version}, salt={salt_b64[:8]}...")
+        logger.debug(f"kdfVersion={kdf_version}, salt_len={len(salt)}")
 
         # Krok 2 — verifier
         verifier = compute_verifier(password, salt, kdf_version)
-        logger.debug(f"verifier={verifier[:8]}...")
 
         # Krok 3 — sesja
         session_url = self._url("sys", "sessionservice")
@@ -321,8 +321,10 @@ class TutaClient:
         try:
             user_data = await self._get(user_url, token=token)
         except TutaAPIError as e:
-            logger.warning(f"Nie udało się pobrać danych użytkownika: {e}")
-            return b"\x00" * 32
+            # Bez user_group_key nic nie działa poprawnie — przerwij login zamiast
+            # kontynuować z atrapą klucza (zera szyfrowałyby/deszyfrowały dane).
+            logger.error(f"Nie udało się pobrać danych użytkownika: {e}")
+            raise
 
         # symEncGKey jest w user.userGroup (pole 95[0]['27']), nie w polu 91
         # Pole 91 to stary format, pole 95 to GroupMembership z aktualnym kluczem
@@ -337,19 +339,17 @@ class TutaClient:
         if not enc_group_key_b64:
             enc_group_key_b64 = user_data.get("91", "")
 
-        logger.debug(f"symEncGKey: {enc_group_key_b64[:20]}...")
-
         if not enc_group_key_b64:
-            logger.warning("Nie znaleziono symEncGKey — klucze będą niedostępne")
-            return b"\x00" * 32
+            raise TutaAPIError(0, "Nie znaleziono symEncGKey w danych użytkownika — nie można odszyfrować klucza grupy")
 
         try:
             enc_group_key = base64.b64decode(enc_group_key_b64)
-            logger.debug(f"symEncGKey bytes: {enc_group_key.hex()[:32]}... len={len(enc_group_key)}")
+            logger.debug(f"symEncGKey len={len(enc_group_key)}")
             return decrypt_user_group_key(password, salt, kdf_version, enc_group_key)
         except Exception as e:
+            # Nie zwracaj atrapy klucza — błąd deszyfrowania musi przerwać login.
             logger.error(f"Błąd deszyfrowania klucza grupy: {e}")
-            return b"\x00" * 32
+            raise TutaAPIError(0, f"Deszyfrowanie userGroupKey nie powiodło się: {e}") from e
 
     async def _load_pq_keys(self, session: Session) -> None:
         """
@@ -1541,7 +1541,6 @@ class TutaClient:
 
         headers = {"accessToken": session.access_token, **TUTANOTA_HEADERS}
         logger.debug(f"create_draft ownerKeyVersion={key_version} mail_group_id={session.mail_group_id}")
-        logger.debug(f"create_draft full body: {json.dumps(body)}")
         logger.debug(f"create_draft POST to={[a for _,a in to_recipients]}")
         async with self._http.post(
             self.base_url + "/rest/tutanota/draftservice",
@@ -2216,8 +2215,7 @@ class TutaClient:
                 group_id = g[-1] if isinstance(g, list) else g
                 key_version = str(m.get("2246", "0") or "0")
                 cal_group_key = aes_decrypt_tuta(session.user_group_key, enc_key)
-                logger.debug("calendar_group_id=%s key=%s... kv=%s",
-                             group_id, cal_group_key.hex()[:16], key_version)
+                logger.debug("calendar_group_id=%s kv=%s", group_id, key_version)
                 return group_id, cal_group_key, key_version
         raise TutaAPIError(0, "Nie znaleziono grupy kalendarza (groupType=9)")
 

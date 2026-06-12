@@ -74,22 +74,24 @@ def _is_newer(latest: str, current: str) -> bool:
         return False
 
 
-def _mtls_context() -> ssl.SSLContext | None:
-    """Buduje SSLContext z certyfikatami klienta. None jeśli pliki nie istnieją."""
-    crt = _CERTS_DIR / "client.crt"
-    key = _CERTS_DIR / "client.key"
-    ca  = _CERTS_DIR / "ca.crt"
-    if not (crt.exists() and key.exists() and ca.exists()):
+def _server_pin_context() -> ssl.SSLContext | None:
+    """Buduje SSLContext pinujący serwer telemetrii do prywatnego CA.
+
+    Bez certyfikatu klienta: projekt jest open-source (AGPL), więc dołączenie
+    klucza klienta nie dałoby realnego uwierzytelnienia — każdy ma dostęp do repo.
+    Pinning serwera (cafile=ca.crt) zapewnia poufność kanału i pewność, że klient
+    łączy się z właściwym serwerem (cert ma IP w SAN). None jeśli ca.crt nie istnieje.
+    """
+    ca = _CERTS_DIR / "ca.crt"
+    if not ca.exists():
         return None
-    ctx = ssl.create_default_context(cafile=str(ca))
-    ctx.load_cert_chain(str(crt), str(key))
-    return ctx
+    return ssl.create_default_context(cafile=str(ca))
 
 
 async def _do_ping(install_id: str, version: str) -> None:
-    ctx = _mtls_context()
+    ctx = _server_pin_context()
     if ctx is None:
-        logger.debug("Telemetria — brak certyfikatów w %s, ping pominięty.", _CERTS_DIR)
+        logger.debug("Telemetria — brak ca.crt w %s, ping pominięty.", _CERTS_DIR)
         return
     try:
         import aiohttp

@@ -1,5 +1,47 @@
 # Changelog
 
+## v1.3.8 — 2026-06-12 — Security: fail closed on key errors, telemetry without mTLS
+
+Security review of the Tuta-facing communication. Three classes of fixes in
+`tuta/api.py`, plus a change to the telemetry trust model.
+
+### Fail closed — `_load_user_keys` (`tuta/api.py`)
+
+Three error paths returned `b"\x00" * 32` instead of aborting login. An all-zero
+dummy key would silently encrypt and decrypt data with a real (zero) key rather
+than surfacing the failure — quiet and dangerous. All three now abort:
+
+- User-data fetch fails → `logger.error` + `raise` (was a warning + dummy key).
+- Missing `symEncGKey` → `TutaAPIError`.
+- `userGroupKey` decryption error → `TutaAPIError(...) from e`.
+
+Callers (`_cmd_login`/`_cmd_authenticate` in IMAP, `handle_DATA` in SMTP) already
+handle these exceptions, so login now returns an error instead of admitting a
+session backed by a dummy key.
+
+### Logs no longer leak key material (`tuta/api.py`)
+
+Removed/trimmed `logger.debug` calls that printed key fragments and full request
+bodies: `symEncGKey` (hex bytes), `salt`, `verifier`, the full `create_draft`
+body, and the calendar group key hex. Logs now show lengths only, never content.
+
+### Salt request — JSON injection (`tuta/api.py`)
+
+`login()` built the `_body` parameter with an f-string and an unescaped email; a
+`"` in the address broke the request structure. Now built with `json.dumps`.
+
+### Telemetry: server pinning instead of mTLS
+
+The telemetry client certificate was committed to this public repo. In an
+open-source (AGPL) project a shipped secret is public, so mTLS gave no real
+client authentication. Removed `client.crt`/`client.key`; the client now pins
+only the server via `ca.crt` (channel confidentiality + server identity, IP in
+SAN), with abuse control handled by nginx rate limiting. The previously committed
+client certificate is now inert — the server no longer verifies client
+certificates.
+
+Files: `tuta/api.py`, `tuta/telemetry.py`, `tuta/certs/`.
+
 ## v1.3.7 — 2026-06-11 — HMAC strict mode + stability fixes
 
 ### Security — HMAC verification now strict
