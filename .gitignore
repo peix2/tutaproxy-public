@@ -7,3 +7,8 @@ __pycache__/
 *.db-wal
 *.log
 .env
+
+# Certyfikaty telemetrii: ca.crt jest publiczny i śledzony; klucze prywatne
+# oraz cert klienta nigdy nie trafiają do repo (gdyby ktoś je tu wrzucił)
+tuta/certs/*.key
+tuta/certs/client.crt
