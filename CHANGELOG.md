@@ -1,5 +1,35 @@
 # Changelog
 
+## v1.3.10 — 2026-06-13 — Move to custom folders + labels (MailSetKind)
+
+`movemailservice` returned **400 (empty body)** when moving a mail into a custom
+folder (type 0). The fix turned out to be about the association-serialization
+convention, not a new API shape:
+
+- `447` (targetFolder, a One association) was sent flat as `[list, elem]` — it must
+  be wrapped: `[[list, elem]]`.
+- `1644` (excludeMailSet, ZeroOrOne) was sent as `null` — it must be `[]`.
+
+Second finding: `folderType "8"` is a **label (MailSetKind.LABEL)**, not a custom
+folder. In the unified model, folders and labels are both MailSets and arrive
+together from `/mailset`. A label is applied via a separate service, not by moving.
+
+### Changes (`tuta/api.py`)
+
+- `move_mails_to_folder()`: corrected serialization (447 wrapped, 1644 = `[]`),
+  plus grouping mails by mailbag listId and chunking by 50 (like the official
+  client). Now works for both custom and system folders.
+- `apply_labels()`: new method — add/remove labels via `ApplyLabelService`
+  (entity 1504).
+- `MailFolder`: `is_label` / `is_system` / `is_custom` properties + `FOLDER_*`
+  constants for the full MailSetKind enum (0–10).
+
+### IMAP (`tuta/imap_server.py`)
+
+- Labels (type 8) are no longer exposed as IMAP folders, so a client can't try to
+  "move" a mail into a label (which the server doesn't support). Moving into a
+  custom folder now works thanks to the `api.py` fix.
+
 ## v1.3.9 — 2026-06-12 — SMTP: session cache (login reused across messages)
 
 SMTP logged in a fresh session for **every** message (full argon2id m=32MB,t=4 +

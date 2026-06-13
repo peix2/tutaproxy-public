@@ -565,7 +565,11 @@ class IMAPConnection:
 
     async def _get_folders(self) -> list[MailFolder]:
         if self._folders is None:
-            self._folders = await self.client.get_folders(self.session)
+            # Etykiety (MailSetKind.LABEL, typ 8) to nie foldery — IMAP nie ma pojęcia
+            # etykiet, a "przeniesienie" do etykiety nie istnieje. Pomijamy je, żeby
+            # klient (Thunderbird) nie próbował do nich kopiować/przenosić.
+            all_sets = await self.client.get_folders(self.session)
+            self._folders = [f for f in all_sets if not f.is_label]
         return self._folders
 
     def _decrypt_folder_own_name(self, folder: MailFolder, mail_group_key: Optional[bytes]) -> str:

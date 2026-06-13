@@ -87,6 +87,9 @@ TUTANOTA_HEADERS = {
     "Accept": "application/json",
 }
 
+# Maks. liczba maili w jednej operacji sync (MAX_NBR_OF_MAILS_SYNC_OPERATION w kliencie Tuty)
+MAX_MOVE_CHUNK = 50
+
 # Nagłówki dla endpointów drive (GroupType.File = "7", ArchiveDataType.DriveFile = "4")
 DRIVE_HEADERS = {
     "v": DRIVE_MODEL_VERSION,
@@ -121,12 +124,30 @@ class Session:
     user_group_id: str = ""                      # elementId grupy użytkownika (potrzebne dla Secure External)
 
 
+# MailSetKind (pole 436 / folderType) — enum z oficjalnego klienta Tuty.
+# W zunifikowanym modelu MailSet zarówno foldery, jak i etykiety są MailSetami
+# i pojawiają się razem w endpoincie /mailset. Rozróżnia je folderType.
+FOLDER_CUSTOM = "0"
+FOLDER_INBOX = "1"
+FOLDER_SENT = "2"
+FOLDER_TRASH = "3"
+FOLDER_ARCHIVE = "4"
+FOLDER_SPAM = "5"
+FOLDER_DRAFT = "6"
+FOLDER_ALL = "7"
+FOLDER_LABEL = "8"       # etykieta — NIE folder; nakłada się przez ApplyLabelService
+FOLDER_IMPORTED = "9"
+FOLDER_SCHEDULED = "10"
+SYSTEM_FOLDER_TYPES = {FOLDER_INBOX, FOLDER_SENT, FOLDER_TRASH,
+                       FOLDER_ARCHIVE, FOLDER_SPAM, FOLDER_DRAFT}
+
+
 @dataclass
 class MailFolder:
     id: str
     mail_list_id: str              # listId z entries (pole 1459)
     name_encrypted: str            # surowy base64 z API (pole 435, zaszyfrowane przez folder_session_key)
-    folder_type: str               # 1=INBOX,2=SENT,3=TRASH,4=ARCHIVE,5=SPAM,6=DRAFT,0=własny
+    folder_type: str               # MailSetKind (pole 436): 0=własny,1-6=systemowe,8=etykieta — patrz FOLDER_*
     owner_enc_session_key: str = ""  # pole 434 — _ownerEncSessionKey (szyfruje pole 435)
     folder_list_id: str = ""       # listId samego folderu (fid[0] z pola 431) — potrzebne dla MoveMailService
     owner_key_version: str = "0"   # pole 1399 — wersja klucza grupy szyfrującego session key
@@ -134,6 +155,21 @@ class MailFolder:
     kdf_nonce: Optional[str] = None  # pole 1847 — _kdfNonce
     parent_folder_raw: Optional[list] = None  # pole 439 — parentFolder (ZeroOrOne), [] lub [[listId, elemId]]
     _name: Optional[str] = None
+
+    @property
+    def is_label(self) -> bool:
+        """True dla etykiet (typ 8) — to nie foldery; maili się do nich nie przenosi."""
+        return self.folder_type == FOLDER_LABEL
+
+    @property
+    def is_system(self) -> bool:
+        """True dla folderów systemowych (Inbox/Sent/Trash/Archive/Spam/Drafts)."""
+        return self.folder_type in SYSTEM_FOLDER_TYPES
+
+    @property
+    def is_custom(self) -> bool:
+        """True dla folderów własnych użytkownika (typ 0)."""
+        return self.folder_type == FOLDER_CUSTOM
 
 
 @dataclass
@@ -1441,33 +1477,93 @@ class TutaClient:
         target_folder_id: str,
     ) -> None:
         """
-        Przenosi maile do wskazanego folderu.
-        POST /rest/tutanota/movemailservice (v=108)
-        mail_ids: lista (listId, elementId) z pola 99 maila.
-        targetFolder = [target_folder_list_id, target_folder_id] (pole 431 folderu).
+        Przenosi maile do wskazanego folderu (własnego lub systemowego).
+        POST /rest/tutanota/movemailservice (v=108), entity MoveMailData (id 445).
+        mail_ids: lista (listId, elementId) z pola 99 maila (listId = mailbag).
+
+        Format żądania (zweryfikowany empirycznie — serwer zwraca 400 bez ciała
+        przy odchyłce):
+          - 447 targetFolder (asocjacja One)  → [[listId, elemId]] (opakowane w tablicę!)
+          - 448 mails (asocjacja Any)         → [[listId, elemId], ...]
+          - 1644 excludeMailSet (ZeroOrOne)   → [] (pusta tablica = brak; null NIE działa)
+          - 1714 moveReason (Number ZeroOrOne)→ None (od TutanotaModel > 97 niepotrzebne)
+
+        Maile grupujemy po listId (mailbag) i wysyłamy po jednym żądaniu na grupę,
+        z chunkowaniem po 50 — tak jak oficjalny klient (serwer blokuje listę).
         """
+        if not mail_ids:
+            return
+        # grupowanie po mailbag listId — maile z jednego folderu mogą być w różnych bagach
+        by_list: dict[str, list[tuple[str, str]]] = {}
+        for lid, eid in mail_ids:
+            by_list.setdefault(lid, []).append((lid, eid))
+
+        headers = {
+            "accessToken": session.access_token,
+            **TUTANOTA_HEADERS,
+        }
+        for lid, group in by_list.items():
+            for i in range(0, len(group), MAX_MOVE_CHUNK):
+                chunk = group[i:i + MAX_MOVE_CHUNK]
+                body = {
+                    "446": "0",
+                    "1714": None,
+                    "447": [[target_folder_list_id, target_folder_id]],
+                    "448": [[g_lid, g_eid] for g_lid, g_eid in chunk],
+                    "1644": [],
+                }
+                logger.debug(f"move_mails_to_folder: body={body}")
+                async with self._http.post(
+                    self.base_url + "/rest/tutanota/movemailservice",
+                    json=body,
+                    headers=headers,
+                ) as r:
+                    text = await r.text()
+                    if r.status not in (200, 201, 204):
+                        logger.debug(f"move_mails_to_folder: {r.status} response={text!r}")
+                        raise _api_error(r.status, text)
+        logger.debug(f"move_mails_to_folder: {len(mail_ids)} mails → {target_folder_id}")
+
+    async def apply_labels(
+        self,
+        session: Session,
+        mail_ids: list[tuple[str, str]],
+        added_labels: list[tuple[str, str]],
+        removed_labels: list[tuple[str, str]],
+    ) -> None:
+        """
+        Nakłada/zdejmuje etykiety (MailSetKind.LABEL, typ 8) na maile.
+        POST /rest/tutanota/applylabelservice (v=108), entity ApplyLabelServicePostIn (id 1504).
+        Etykiety to osobny mechanizm niż foldery — maila nie przenosi się do etykiety,
+        tylko się ją tagiem dokłada/zdejmuje (mail zostaje w swoim folderze).
+
+          - 1506 mails (Any)         → [[listId, elemId], ...]   (Mail._id)
+          - 1507 addedLabels (Any)   → [[listId, elemId], ...]   (MailSet._id etykiety)
+          - 1508 removedLabels (Any) → [[listId, elemId], ...]
+        """
+        if not mail_ids or (not added_labels and not removed_labels):
+            return
         body = {
-            "446": "0",
-            "1714": None,
-            "447": [target_folder_list_id, target_folder_id],
-            "448": [[lid, eid] for lid, eid in mail_ids],
-            "1644": None,
+            "1505": "0",
+            "1506": [[lid, eid] for lid, eid in mail_ids],
+            "1507": [[lid, eid] for lid, eid in added_labels],
+            "1508": [[lid, eid] for lid, eid in removed_labels],
         }
         headers = {
             "accessToken": session.access_token,
             **TUTANOTA_HEADERS,
         }
-        logger.debug(f"move_mails_to_folder: body={body}")
+        logger.debug(f"apply_labels: body={body}")
         async with self._http.post(
-            self.base_url + "/rest/tutanota/movemailservice",
+            self.base_url + "/rest/tutanota/applylabelservice",
             json=body,
             headers=headers,
         ) as r:
             text = await r.text()
             if r.status not in (200, 201, 204):
-                logger.debug(f"move_mails_to_folder: {r.status} response={text!r}")
+                logger.debug(f"apply_labels: {r.status} response={text!r}")
                 raise _api_error(r.status, text)
-        logger.debug(f"move_mails_to_folder: {len(mail_ids)} mails → {target_folder_id}")
+        logger.debug(f"apply_labels: {len(mail_ids)} mails, +{len(added_labels)}/-{len(removed_labels)} labels")
 
     async def create_draft(
         self,
