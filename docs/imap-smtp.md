@@ -82,6 +82,6 @@ The proxy activates this mode when the outgoing message includes the custom SMTP
 ## Known limitations
 
 - No TLS between the email client and the proxy — traffic stays on localhost, unencrypted. Do not expose proxy ports to a network.
-- SEARCH is minimal: only `ALL` and `UNDELETED` are fully handled. Complex server-side search queries fall back to an empty result.
+- IMAP SEARCH (full-text) is not implemented and will not be. Modern mail clients maintain their own local indexes and do not need server-side FTS. Adding a local encrypted index here would only duplicate data and widen the local data-leak surface. Currently `ALL` and `UNDELETED` are handled; all other search queries return an empty result.
 - Tuta two-factor authentication (2FA) is not supported.
 - One Tuta account per proxy instance.

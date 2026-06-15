@@ -242,7 +242,7 @@ Any client that supports IMAP4rev1 with AUTH=PLAIN and standard SMTP AUTH should
 ### Known limitations
 
 - No TLS between the email client and the proxy — traffic stays on localhost, but it is unencrypted. Don't expose the proxy ports to a network.
-- SEARCH is minimal — only `ALL` and `UNDELETED` are fully handled. Complex server-side search queries fall back to an empty result.
+- IMAP SEARCH (full-text) is not implemented and will not be. Modern mail clients (Thunderbird, Apple Mail, Outlook) maintain their own local indexes and do not rely on server-side FTS. Implementing a local encrypted index in the proxy would only duplicate data and increase the local data-leak surface. Currently `ALL` and `UNDELETED` are handled; other search queries return an empty result.
 - Tuta two-factor authentication (2FA) is not supported.
 - Only one Tuta account per proxy instance.
 
