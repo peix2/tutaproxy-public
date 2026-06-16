@@ -52,9 +52,11 @@ def _decode_address(agg, mail_key: bytes) -> tuple[str, str]:
 
 
 def _format_address(name: str, address: str) -> str:
-    if name:
+    if name and address:
         return f"{name} <{address}>"
-    return address
+    if address:
+        return address
+    return name  # pusty adres: zwróć name as-is (może zawierać już sformatowany adres)
 
 
 # Tuta używa base64Ext (sortowalne leksykograficznie) dla GeneratedId.
@@ -116,20 +118,22 @@ def build_rfc2822(
     # --- Temat ---
     subject = _decrypt_str(mail_key, mail_raw.get("105", "")) or "(brak tematu)"
 
-    # --- Data odebrania ---
-    received_ts_ms = int(mail_raw.get("107", 0) or 0)
-    if received_ts_ms:
-        received_date = datetime.fromtimestamp(received_ts_ms / 1000, tz=timezone.utc)
-    else:
-        received_date = datetime.now(tz=timezone.utc)
-
     # --- Nadawca (pole 111 = agregat MailAddress) ---
     sender_agg = mail_raw.get("111", {})
+    logger.debug("build_rfc2822: raw sender_agg (pole 111) = %r", sender_agg)
     sender_name, sender_address = _decode_address(sender_agg, mail_key)
+    logger.debug("build_rfc2822: sender_name=%r sender_address=%r", sender_name, sender_address)
 
     # --- Odbiorcy (przez MailDetails → pole 1305[0] → 1286 → Recipients) ---
     mail_details_list = mail_details_blob.get("1305", [])
     mail_details = mail_details_list[0] if isinstance(mail_details_list, list) and mail_details_list else {}
+
+    # --- Data: sentDate (1284) z MailDetails jako primary, receivedDate (107) jako fallback.
+    # Lokalna strefa czasowa pochodzi z TZ (env/system) — respektuje TZ z docker-compose.
+    sent_ts_str = mail_details.get("1284", "") or ""
+    ts_ms = int(sent_ts_str or mail_raw.get("107", 0) or 0)
+    mail_date = datetime.fromtimestamp(ts_ms / 1000).astimezone() if ts_ms else datetime.now().astimezone()
+
     recipients_agg = mail_details.get("1286", {})
     if isinstance(recipients_agg, list):
         recipients_agg = recipients_agg[0] if recipients_agg else {}
@@ -206,7 +210,7 @@ def build_rfc2822(
         msg["To"] = ", ".join(to_addrs)
     if cc_addrs:
         msg["Cc"] = ", ".join(cc_addrs)
-    msg["Date"] = email.utils.format_datetime(received_date)
+    msg["Date"] = email.utils.format_datetime(mail_date)
     msg["Message-ID"] = message_id
 
     return msg.as_bytes()

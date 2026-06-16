@@ -1,5 +1,43 @@
 # Changelog
 
+## v1.3.11 — 2026-06-16 — From header fix + Date in local timezone
+
+### Bug fix: malformed `From:` header
+
+When opening a sent mail, the `From:` header could appear as
+`Name <email@example.com> <>` — with a spurious trailing `<>`.
+
+Root cause: `_format_address()` unconditionally wrapped the name in
+`<address>` even when `address` was an empty string (which Tuta can return
+for the sender field in Sent-folder mails). Fixed by only adding `<address>`
+when the address is non-empty.
+
+### Date header in local timezone
+
+The `Date:` header was always formatted as UTC (`+0000`). Email clients
+display dates in local time in the message list, but forwarded-message
+blocks include the raw header — so the timezone offset was visible to users
+as `+0000`.
+
+The date is now formatted using the local timezone from the `TZ` environment
+variable (already present in `docker-compose.yml` as `TZ: Pacific/Auckland`
+or the equivalent for your location) or the system timezone when running
+outside Docker.
+
+As a side effect, `sentDate` (field 1284 from MailDetails) is now preferred
+over `receivedDate` (field 107) as the `Date:` header timestamp — this
+reflects when the sender dispatched the message rather than when the server
+received it.
+
+### Changes
+
+- `tuta/message_builder.py` — `_format_address`: skip `<address>` wrapper
+  when address is empty
+- `tuta/message_builder.py` — `build_rfc2822`: use `sentDate` (1284) with
+  `receivedDate` (107) fallback; format with local timezone via `.astimezone()`
+- `tuta/imap_server.py` — `_get_quick_headers`: same local-timezone fix for
+  the quick `Date:` header
+
 ## v1.3.10 — 2026-06-13 — Move to custom folders + labels (MailSetKind)
 
 `movemailservice` returned **400 (empty body)** when moving a mail into a custom

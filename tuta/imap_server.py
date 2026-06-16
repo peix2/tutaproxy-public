@@ -992,7 +992,7 @@ class IMAPConnection:
         subject = _decrypt_str(mail_key, mail_raw.get("105", "")) or "(brak tematu)"
 
         ts = int(mail_raw.get("107", 0) or 0)
-        dt = datetime.fromtimestamp(ts / 1000, tz=timezone.utc) if ts else datetime.now(tz=timezone.utc)
+        dt = datetime.fromtimestamp(ts / 1000).astimezone() if ts else datetime.now().astimezone()
 
         sender_name, sender_address = _decode_address(mail_raw.get("111", {}), mail_key)
         from_str = _format_address(sender_name, sender_address)
