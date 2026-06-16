@@ -1,5 +1,23 @@
 # Changelog
 
+## v1.3.12 — 2026-06-16 — Permanent delete fix (folder field)
+
+### Bug fix: permanent mail deletion failed with HTTP 400
+
+`delete_mails` (DELETE /rest/tutanota/mailservice, DeleteMailData) sent the
+`folder` field (724, a ZeroOrOne association) as `null` when no source folder
+was given, which the server rejects with HTTP 400. Permanent deletion of mails
+already in Trash/Spam therefore failed.
+
+Fixed by sending an empty array `[]` when no folder is given and a wrapped
+`[[listId, elementId]]` when one is — the same pattern already used for
+`excludeMailSet` in `move_mails_to_folder`.
+
+### Changes
+
+- `tuta/api.py` — `delete_mails`: field 724 as `[]` / `[[listId, elementId]]`
+  instead of `null`
+
 ## v1.3.11 — 2026-06-16 — From header fix + Date in local timezone
 
 ### Bug fix: malformed `From:` header

@@ -1415,10 +1415,13 @@ class TutaClient:
         Używane gdy mail jest już w Koszu i chcemy go usunąć na stałe.
         folder_id: opcjonalny (listId, elementId) folderu źródłowego jako filtr.
         """
+        # Pole 724 (folder) to asocjacja ZeroOrOne — serwer wymaga pustej tablicy []
+        # gdy brak, oraz [[listId, elemId]] (opakowane) gdy podany. null daje 400
+        # (ten sam smak co excludeMailSet w move_mails_to_folder).
         body: dict = {
             "420": "0",
             "421": [[lid, eid] for lid, eid in mail_ids],
-            "724": list(folder_id) if folder_id else None,
+            "724": [list(folder_id)] if folder_id else [],
         }
         headers = {
             "accessToken": session.access_token,
