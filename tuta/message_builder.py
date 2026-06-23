@@ -191,6 +191,14 @@ def build_rfc2822(
             mime_main, _, mime_sub = att["mime_type"].partition("/")
             if not mime_sub:
                 mime_main, mime_sub = "application", "octet-stream"
+            # Typy message/* (poza rfc822) i multipart/* mają w email.generator
+            # dedykowane handlery oczekujące zagnieżdżonych obiektów Message.
+            # MIMEBase + base64 daje payload-string → flatten() crashuje z
+            # "'str' object has no attribute 'policy'". Częste w bounce'ach DSN
+            # (message/delivery-status). Demotujemy do octet-stream — surowe dane
+            # bez zmian, a czytelna treść bounce'a i tak jest w body.
+            if mime_main == "multipart" or (mime_main == "message" and mime_sub != "rfc822"):
+                mime_main, mime_sub = "application", "octet-stream"
             part = email.mime.base.MIMEBase(mime_main, mime_sub)
             part.set_payload(att["data"])
             email.encoders.encode_base64(part)

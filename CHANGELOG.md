@@ -1,5 +1,28 @@
 # Changelog
 
+## v1.3.13 — 2026-06-23 — IMAP FETCH: bounce with DSN report no longer crashes
+
+### Bug fix: FETCH crashed on bounce messages
+
+A bounce message (e.g. "mailbox full") carrying a `message/delivery-status`
+attachment made `FETCH` fail with `'str' object has no attribute 'policy'`.
+Thunderbird showed the mail header (fast path, no API call) but never received
+the body.
+
+Root cause: `build_rfc2822()` built every attachment as `MIMEBase` + base64.
+For `message/*` (other than rfc822) and `multipart/*` types, `email.generator`
+has dedicated handlers (`_handle_message_delivery_status`, `_handle_multipart`)
+that iterate the payload expecting nested `Message` objects — a base64 string
+has no `.policy` attribute, so `as_bytes()` raised and the whole FETCH failed.
+
+### Changes
+
+- `tuta/message_builder.py` — attachments of type `message/*` (other than
+  rfc822) and `multipart/*` are demoted to `application/octet-stream`. Raw data
+  is preserved; the human-readable bounce text is already in the body. A
+  `message/rfc822` part is left untouched — Thunderbird re-parses it and shows
+  the embedded original.
+
 ## v1.3.12 — 2026-06-16 — Permanent delete fix (folder field)
 
 ### Bug fix: permanent mail deletion failed with HTTP 400
