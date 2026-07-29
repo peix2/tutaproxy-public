@@ -572,6 +572,37 @@ class IMAPConnection:
             self._folders = [f for f in all_sets if not f.is_label]
         return self._folders
 
+    async def _find_folder_by_name(
+        self, name: str, refresh_on_miss: bool = True
+    ) -> Optional[MailFolder]:
+        """
+        Znajduje folder po pełnej nazwie IMAP (ze ścieżką rodzica).
+
+        Cache folderów (`self._folders`) jest per-połączenie i nie widzi zmian
+        wykonanych na INNYM połączeniu z puli klienta. Gdy Thunderbird jednym
+        połączeniem reparentuje/zmienia nazwę folderu, a drugim (z nieświeżym
+        cache) przenosi do niego maila, lookup po nazwie chybia → COPY/SELECT
+        zwracały 'folder not found', a mail „wracał" do Odebranych.
+
+        Przy chybieniu odświeżamy cache raz i szukamy ponownie.
+        """
+        mail_group_key = await self._get_mail_group_key()
+        target_upper = name.upper()
+
+        def _lookup(folders: list[MailFolder]) -> Optional[MailFolder]:
+            folder_map = {f.id: f for f in folders}
+            return next(
+                (f for f in folders
+                 if self._folder_imap_name(f, mail_group_key, folder_map).upper() == target_upper),
+                None,
+            )
+
+        target = _lookup(await self._get_folders())
+        if target is None and refresh_on_miss:
+            self._folders = None  # cache mógł być nieświeży (zmiana z innego połączenia)
+            target = _lookup(await self._get_folders())
+        return target
+
     def _decrypt_folder_own_name(self, folder: MailFolder, mail_group_key: Optional[bytes]) -> str:
         """Zwraca tylko własną nazwę folderu (bez ścieżki rodzica)."""
         system_name = FOLDER_TYPE_NAMES.get(folder.folder_type)
@@ -651,21 +682,12 @@ class IMAPConnection:
             return
 
         mailbox_name = decode_mutf7(_unquote(args.strip()))
-        folders = await self._get_folders()
 
-        # Znajdź folder po nazwie IMAP
-        mail_group_key = await self._get_mail_group_key()
-        folder_map = {f.id: f for f in folders}
-        target = None
-        for f in folders:
-            imap_name = self._folder_imap_name(f, mail_group_key, folder_map)
-            logger.debug(f"[{self.peer}] SELECT try: '{mailbox_name}' vs '{imap_name}' (id={f.id}, type={f.folder_type})")
-            if imap_name.upper() == mailbox_name.upper():
-                target = f
-                break
-
+        # Znajdź folder po nazwie IMAP (refresh cache przy chybieniu — zmiana
+        # folderu z innego połączenia puli, patrz _find_folder_by_name)
+        target = await self._find_folder_by_name(mailbox_name)
         if target is None:
-            logger.warning(f"[{self.peer}] SELECT '{mailbox_name}' — folder not found in {len(folders)} folders")
+            logger.warning(f"[{self.peer}] SELECT '{mailbox_name}' — folder not found")
             self._no(tag, f"[NONEXISTENT] Mailbox not found: {mailbox_name}")
             return
 
@@ -735,15 +757,7 @@ class IMAPConnection:
         mailbox_name = decode_mutf7(_unquote(m.group(1)))
         requested = m.group(2).upper().split()
 
-        folders = await self._get_folders()
-        mail_group_key = await self._get_mail_group_key()
-        folder_map = {f.id: f for f in folders}
-        target = None
-        for f in folders:
-            if self._folder_imap_name(f, mail_group_key, folder_map).upper() == mailbox_name.upper():
-                target = f
-                break
-
+        target = await self._find_folder_by_name(mailbox_name)
         if target is None:
             self._no(tag, f"[NONEXISTENT] Mailbox not found: {mailbox_name}")
             return
@@ -1729,14 +1743,7 @@ class IMAPConnection:
         seq_set_str = m.group(1)
         folder_name = m.group(2).strip('"')
 
-        mail_group_key = self.mailbox.mail_group_key if self.mailbox else None
-        folders = await self._get_folders()
-        folder_map = {f.id: f for f in folders}
-        target = next(
-            (f for f in folders
-             if self._folder_imap_name(f, mail_group_key, folder_map).upper() == folder_name.upper()),
-            None,
-        )
+        target = await self._find_folder_by_name(folder_name)
         if target is None:
             self._no(tag, f"COPY: folder '{folder_name}' not found")
             return

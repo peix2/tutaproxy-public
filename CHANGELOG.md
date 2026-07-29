@@ -1,5 +1,36 @@
 # Changelog
 
+## v1.3.14 — 2026-07-29 — IMAP: moving/selecting a folder changed on another connection
+
+### Bug fix: move to a just-reparented folder failed ("folder not found")
+
+**Symptom** (Thunderbird): a folder created as a subfolder of Inbox and then
+moved up to the top level (reparent). Moving a mail from Inbox into that folder
+did nothing — the mail "came back" to Inbox. Workaround: move the mail to a
+different, older folder first, then into the target.
+
+**Root cause**: the folder cache (`IMAPConnection._folders`) is per-connection
+and only invalidated by a folder operation on the *same* connection (CREATE/
+DELETE/RENAME) or a re-login. Thunderbird keeps a connection pool: the reparent
+runs on one connection while the move (IMAP COPY + `\Deleted` + EXPUNGE) runs on
+another — with a stale cache that still sees the folder under its old path
+(`INBOX/name`). The IMAP-name lookup misses → `COPY: folder '…' not found` (NO).
+Thunderbird had optimistically hidden the message, so after a resync it reappears
+in Inbox.
+
+The bug does *not* occur at the API level (the move itself works, including into
+a folder created under Inbox and reparented to root) — only in the IMAP layer.
+Reproduced with two IMAP connections (one RENAME, the other COPY): the stale
+connection returned `NO folder not found`, the fresh one `OK`.
+
+### Change (`tuta/imap_server.py`)
+
+- New `_find_folder_by_name()` helper with refresh-on-miss (cache miss → refresh
+  → retry): if a folder is not found by IMAP name, the cache is invalidated once
+  and the lookup retried.
+- Wired into COPY, SELECT and STATUS — also deduplicates the repeated lookup
+  pattern.
+
 ## v1.3.13 — 2026-06-23 — IMAP FETCH: bounce with DSN report no longer crashes
 
 ### Bug fix: FETCH crashed on bounce messages
