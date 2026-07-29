@@ -16,6 +16,7 @@ import hashlib
 import hmac as _hmac
 import logging
 import os
+import time
 from dataclasses import dataclass
 from typing import Optional
 
@@ -747,3 +748,33 @@ def b64url_decode(s: str) -> bytes:
 
 def b64url_encode(b: bytes) -> str:
     return base64.b64encode(b).decode().replace("+", "-").replace("/", "_").rstrip("=")
+
+
+# ---------------------------------------------------------------------------
+# TOTP (2FA) — zgodne z klientem Tuty (TotpVerifier)
+# ---------------------------------------------------------------------------
+
+def _b32_normalize_decode(secret_base32: str) -> bytes:
+    """Dekoduje sekret base32; toleruje spacje, małe litery i brak paddingu
+    (format 'readableKey' Tuty: małe litery, grupy po 4, bez '=')."""
+    s = secret_base32.strip().replace(" ", "").upper()
+    s += "=" * (-len(s) % 8)
+    return base64.b32decode(s)
+
+
+def generate_totp(secret_base32: str, for_time: Optional[float] = None) -> int:
+    """
+    Kod TOTP (RFC 6238) zgodny z TotpVerifier Tuty: HMAC-SHA1, okno 30 s, 6 cyfr,
+    licznik = floor(unixtime / 30) jako 8-bajtowy big-endian.
+    """
+    key = _b32_normalize_decode(secret_base32)
+    counter = int((for_time if for_time is not None else time.time()) // 30)
+    digest = _hmac.new(key, counter.to_bytes(8, "big"), hashlib.sha1).digest()
+    offset = digest[-1] & 0x0F
+    binary = (
+        ((digest[offset] & 0x7F) << 24)
+        | (digest[offset + 1] << 16)
+        | (digest[offset + 2] << 8)
+        | digest[offset + 3]
+    )
+    return binary % 1_000_000

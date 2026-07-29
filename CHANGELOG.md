@@ -1,5 +1,47 @@
 # Changelog
 
+## v1.3.15 — 2026-07-29 — Login with 2FA (TOTP)
+
+Support for accounts that have TOTP two-factor authentication enabled. Previously
+login to such an account failed: `sessionservice` returned a non-empty `challenges`
+list (field 1222) that the proxy ignored — the session stayed locked and access to
+encrypted data failed.
+
+### Flow (SecondFactorAuthService, sys)
+
+1. POST sessionservice → `accessToken` (1221) + `challenges` (1222).
+2. If a challenge has `type == 1` (TOTP): POST `secondfactorauthservice` with
+   `SecondFactorAuthData{type=1230, otpCode=1243, session=1232}`.
+3. GET `secondfactorauthservice` (poll) until `secondFactorPending` (1238) == false.
+4. Continue loading keys as normal.
+
+The `session` IdTuple is derived from the `accessToken` the same way as in Tuta's
+`LoginFacade`: `listId = base64Ext(raw[:9])`, `elemId = base64url(sha256(raw[9:]))`.
+
+### Association envelope — same pattern as v1.3.10
+
+- empty aggregations `u2f` (1231) and `webauthn` (1905) as `[]`, not `null`;
+- `session` (1232, ZeroOrOne IdTuple) as `[[listId, elemId]]`, not `[listId, elemId]`.
+
+### TOTP
+
+Standard RFC 6238 (HMAC-SHA1, 30 s window, 6 digits), compatible with Tuta's
+`TotpVerifier`, with no new dependency (stdlib only).
+
+### Configuration
+
+`TUTA_TOTP_SECRET` = the base32 secret from the 2FA setup in the Tuta app (see
+`docs/2fa.md`). Enabling/disabling 2FA is done **only in the official client** —
+adding or removing a factor via the API returns 403. The proxy only *logs in*
+through 2FA; it does not manage factors.
+
+### Changes
+- `tuta/crypto.py`: `generate_totp` (RFC 6238) + `_b32_normalize_decode`.
+- `tuta/api.py`: `_session_id_from_access_token`, `_second_factor_auth`, handling
+  of `challenges` in `login()`; base64Ext constants + `GENERATED_ID_BYTES_LENGTH`.
+- config: `TUTA_TOTP_SECRET` (README env table, `docker/docker-compose.yml`),
+  new `docs/2fa.md`.
+
 ## v1.3.14 — 2026-07-29 — IMAP: moving/selecting a folder changed on another connection
 
 ### Bug fix: move to a just-reparented folder failed ("folder not found")

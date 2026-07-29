@@ -18,6 +18,8 @@ services:
       TZ: Pacific/Auckland
       # Wyłącz telemetrię (sprawdzanie wersji + liczenie instalacji):
       # TUTAPROXY_TELEMETRY: "false"
+      # 2FA: sekret base32 z aplikacji Tuty — TYLKO gdy konto ma TOTP (docs/2fa.md):
+      # TUTA_TOTP_SECRET: "jbsw y3dp ehpk 3pxp"
       # Gdy Tuta zbumpuje wersję API, nadpisz tu bez przebudowania obrazu:
       # TUTA_SYS_VERSION: "150"
       # TUTA_TUTANOTA_VERSION: "108"

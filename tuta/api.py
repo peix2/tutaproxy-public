@@ -44,6 +44,7 @@ from .crypto import (
     compress_lz4,
     b64url_decode,
     b64url_encode,
+    generate_totp,
     decrypt_user_group_key,
     pq_encapsulate_bucket_key,
     pq_decapsulate_bucket_key,
@@ -89,6 +90,29 @@ TUTANOTA_HEADERS = {
 
 # Maks. liczba maili w jednej operacji sync (MAX_NBR_OF_MAILS_SYNC_OPERATION w kliencie Tuty)
 MAX_MOVE_CHUNK = 50
+
+# Długość części listId w GeneratedId (GENERATED_ID_BYTES_LENGTH w kliencie Tuty).
+GENERATED_ID_BYTES_LENGTH = 9
+
+# Alfabet base64Ext Tuty (sortowalny leksykograficznie) — do kodowania listId sesji.
+_B64_STD_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+_B64_EXT_ALPHABET = "-0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz"
+_STD_TO_EXT = {c: _B64_EXT_ALPHABET[i] for i, c in enumerate(_B64_STD_ALPHABET)}
+
+
+def _session_id_from_access_token(access_token: str) -> list:
+    """
+    Wyprowadza IdTuple sesji [listId, elementId] z accessTokenu — odwzorowanie
+    LoginFacade.getSessionListId / getSessionElementId:
+      listId    = base64Ext(pierwsze 9 bajtów)
+      elementId = base64url(sha256(pozostałe bajty))
+    Potrzebne do pola session (1232) w SecondFactorAuthData przy 2FA.
+    """
+    raw = b64url_decode(access_token)
+    list_std = base64.b64encode(raw[:GENERATED_ID_BYTES_LENGTH]).decode()
+    list_id = "".join(_STD_TO_EXT[c] for c in list_std if c != "=")
+    element_id = b64url_encode(hashlib.sha256(raw[GENERATED_ID_BYTES_LENGTH:]).digest())
+    return [list_id, element_id]
 
 # Nagłówki dla endpointów drive (GroupType.File = "7", ArchiveDataType.DriveFile = "4")
 DRIVE_HEADERS = {
@@ -323,6 +347,14 @@ class TutaClient:
         session_resp = await self._post(session_url, session_body)
 
         access_token = session_resp.get("1221", "")
+
+        # Krok 3a — 2FA: niepusta lista challenges (pole 1222) = sesja zablokowana
+        # drugim składnikiem. Domykamy ją przez SecondFactorAuthService (tylko TOTP).
+        challenges = session_resp.get("1222", []) or []
+        if challenges:
+            logger.info("Sesja wymaga 2FA — %d challenge(y)", len(challenges))
+            await self._second_factor_auth(access_token, challenges)
+
         user_id_list = session_resp.get("1223", [""])
         user_id = user_id_list[-1] if user_id_list else ""
         logger.info(f"Sesja OK, userId={user_id}")
@@ -343,6 +375,50 @@ class TutaClient:
         await self._load_pq_keys(session)
 
         return session
+
+    async def _second_factor_auth(self, access_token: str, challenges: list) -> None:
+        """
+        Domyka logowanie na koncie z 2FA (TOTP). Wołane gdy sessionservice zwróci
+        niepustą listę challenges (pole 1222) — sesja istnieje, ale jest zablokowana.
+
+        Flow (LoginFacade + SecondFactorAuthService, sys):
+          1. POST secondfactorauthservice: SecondFactorAuthData{type, otpCode, session}.
+          2. GET secondfactorauthservice: SecondFactorAuthGetData{accessToken} aż
+             secondFactorPending (1238) == false.
+
+        Obsługiwany tylko TOTP (type=1). U2F/WebAuthn wymagają sprzętu/przeglądarki.
+        Sekret TOTP (base32 z konfiguracji 2FA) w zmiennej TUTA_TOTP_SECRET.
+        """
+        totp_secret = os.environ.get("TUTA_TOTP_SECRET", "").strip()
+        # Wartości pola type challenge’a: SecondFactorType (u2f=0, totp=1, webauthn=2).
+        has_totp = any(str(c.get("1189", "")) == "1" for c in challenges)
+        if not has_totp:
+            raise TutaAPIError(0, "Konto wymaga 2FA, ale bez TOTP — U2F/WebAuthn nieobsługiwane przez proxy")
+        if not totp_secret:
+            raise TutaAPIError(0, "Konto wymaga 2FA (TOTP) — ustaw TUTA_TOTP_SECRET")
+
+        url = self._url("sys", "secondfactorauthservice")
+        # Puste association Tuta serializuje jako [], nie null; pojedyncze IdTuple
+        # jako listę krotek [[listId, elemId]] (jak w rename_folder / mailfolderservice).
+        auth_body = {
+            "542": "0",                                        # _format
+            "1230": "1",                                       # type = totp
+            "1243": str(generate_totp(totp_secret)),           # otpCode (Number → string)
+            "1231": [],                                        # u2f (agregacja) — puste
+            "1232": [_session_id_from_access_token(access_token)],  # session → [[listId, elemId]]
+            "1905": [],                                        # webauthn (agregacja) — puste
+        }
+        await self._post(url, auth_body)
+
+        # Poll — czekaj aż serwer odblokuje sesję (dla TOTP zwykle natychmiast).
+        for attempt in range(10):
+            params = {"_body": json.dumps({"1234": "0", "1235": access_token})}
+            resp = await self._get(url, params=params)
+            if str(resp.get("1238", "")).lower() in ("0", "false"):
+                logger.info("2FA (TOTP) potwierdzone (próba %d)", attempt + 1)
+                return
+            await asyncio.sleep(1)
+        raise TutaAPIError(0, "2FA: serwer nie potwierdził uwierzytelnienia (secondFactorPending)")
 
     async def _load_user_keys(
         self,

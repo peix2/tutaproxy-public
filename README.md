@@ -16,6 +16,7 @@ Tuta is a privacy-focused email service with strong end-to-end encryption. It on
 
 - **Read email** — full IMAP access to all your Tuta folders (Inbox, Sent, Drafts, Trash, Spam, Archive, and any custom folders)
 - **Send email** — SMTP sending with attachment support
+- **Two-factor auth (TOTP)** — log in to accounts that have TOTP two-factor enabled; set the base32 secret via `TUTA_TOTP_SECRET` (see [docs/2fa.md](docs/2fa.md))
 - **End-to-end encryption** — Tuta→Tuta emails are sent with full E2E encryption (ECC + ML-KEM/Kyber); emails to external addresses use standard delivery or Secure External (see below)
 - **Secure External** — send password-protected encrypted mail to non-Tuta recipients; they receive a link and enter the password to read the message on Tuta's portal
 - **Attachments** — download and upload, including inline images
@@ -92,6 +93,7 @@ python run_webdav.py
 | `TUTA_WEBDAV_HOST` | `127.0.0.1` (Docker overrides to `0.0.0.0`) | WebDAV bind address |
 | `TUTA_WEBDAV_PORT` | `5234` | WebDAV port |
 | `TUTA_CACHE_PATH` | `tuta_cache.db` | SQLite cache file path |
+| `TUTA_TOTP_SECRET` | *(none)* | Base32 TOTP secret; required **only** if the account has 2FA (TOTP) enabled — see [docs/2fa.md](docs/2fa.md) |
 | `LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR` |
 | `LOG_FILE` | *(stderr)* | Path to log file; if set, logs go to file instead of stderr |
 | `LOG_ROTATE_BYTES` | `52428800` (50 MB) | Max log file size before rotation |
