@@ -787,6 +787,10 @@ class IMAPConnection:
             elif item == "UIDVALIDITY":
                 parts.append(f"UIDVALIDITY {uid_validity}")
 
+        # Odtwórz pełną ścieżkę IMAP folderu — potrzebne mail_group_key (deszyfracja
+        # nazw) i folder_map (hierarchia rodziców); wcześniej były niezdefiniowane → NameError.
+        mail_group_key = await self._get_mail_group_key()
+        folder_map = {f.id: f for f in await self._get_folders()}
         imap_name = encode_mutf7(self._folder_imap_name(target, mail_group_key, folder_map))
         self._untagged(f"STATUS {_quote(imap_name)} ({' '.join(parts)})")
         self._ok(tag, "STATUS completed")

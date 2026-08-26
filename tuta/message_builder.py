@@ -52,10 +52,22 @@ def _decode_address(agg, mail_key: bytes) -> tuple[str, str]:
 
 
 def _format_address(name: str, address: str) -> str:
-    if name and address:
-        return f"{name} <{address}>"
+    name = (name or "").strip()
+    address = (address or "").strip()
+    # Tuta bywa, że w polu name trzyma cały sformatowany adres "Nazwa <a@b>"
+    # (np. kontakt wpisany ręcznie). Bez rozpakowania klient IMAP renderuje
+    # śmieci: podwójną kopertę "Nazwa <a@b> <a@b>" albo — gdy address pusty —
+    # display-name z pustą kopertą "Nazwa <a@b> <>". Pole address jest nadrzędne.
+    if name and "<" in name and ">" in name:
+        parsed_name, parsed_addr = email.utils.parseaddr(name)
+        if parsed_addr:
+            name = parsed_name.strip()
+            if not address:
+                address = parsed_addr
+    # formataddr poprawnie cytuje display-name ze znakami specjalnymi RFC 5322
+    # (@ , < > . : ;) — ręczne f"{name} <{address}>" dawało nielegalne nagłówki.
     if address:
-        return address
+        return email.utils.formataddr((name, address))
     return name  # pusty adres: zwróć name as-is (może zawierać już sformatowany adres)
 
 

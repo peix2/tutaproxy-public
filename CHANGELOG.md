@@ -1,5 +1,29 @@
 # Changelog
 
+## v1.3.16 — 2026-08-27 — IMAP fixes: STATUS and address formatting
+
+Two correctness fixes (also present in v1.3.13–v1.3.15).
+
+### STATUS raised `NameError: mail_group_key`
+
+`_cmd_status` built the folder name via `_folder_imap_name(target, mail_group_key,
+folder_map)` but — unlike `LIST`/`APPEND`/`_find_folder_by_name` — never fetched
+those two variables. Every `STATUS` (Thunderbird polls unread counts this way)
+raised, even though `MESSAGES/UNSEEN/UIDNEXT` had already been computed. Fix: fetch
+`mail_group_key` + `folder_map` before building the name, like the other handlers.
+
+### "Reply to all" mangled one recipient (trailing `<>`)
+
+`_format_address` built the header by hand (`f"{name} <{address}>"`), without
+quoting the display name and without handling the case where Tuta stores a fully
+formatted address (`Name <a@b>`) in the `name` field. That produced
+`Name <a@b> <a@b>` (double envelope) or `Name <a@b> <>` (empty envelope), which
+Thunderbird rendered as a broken address and carried forward on reply-all. It also
+broke display names with RFC 5322 special characters (e.g. an unquoted `@` or
+comma). Fix: unwrap a nested `<...>` via `email.utils.parseaddr` (the `address`
+field takes precedence) and build the header with `email.utils.formataddr`, which
+quotes the display name correctly.
+
 ## v1.3.15 — 2026-07-29 — Login with 2FA (TOTP)
 
 Support for accounts that have TOTP two-factor authentication enabled. Previously
