@@ -4,7 +4,7 @@ Klient REST API serwisu Tuta (app.tuta.com).
 
 Protokół ustalony na podstawie analizy ruchu HTTP (mitmproxy, maj 2026):
   - Nagłówek v: 150 (sys), 108 (tutanota)
-  - Nagłówki cp: 5, cv: 346.260428.0
+  - Nagłówki cp: 5, cv: 359.260904.0
   - Ciała JSON używają NUMERYCZNYCH kluczy zamiast nazw pól
   - Salt zwracany w zwykłym base64 (nie url-safe)
 
@@ -67,7 +67,7 @@ TUTA_BASE_URL = "https://app.tuta.com"
 SYS_MODEL_VERSION     = os.environ.get("TUTA_SYS_VERSION",      "150")
 TUTANOTA_MODEL_VERSION = os.environ.get("TUTA_TUTANOTA_VERSION", "108")
 STORAGE_MODEL_VERSION  = os.environ.get("TUTA_STORAGE_VERSION",  "14")
-CLIENT_VERSION         = os.environ.get("TUTA_CLIENT_VERSION",   "346.260428.0")
+CLIENT_VERSION         = os.environ.get("TUTA_CLIENT_VERSION",   "359.260904.0")
 DRIVE_MODEL_VERSION    = os.environ.get("TUTA_DRIVE_VERSION",    "4")
 
 # Nagłówki dla endpointów sys
@@ -249,8 +249,20 @@ class TutaClient:
 
     @staticmethod
     def _check_version_mismatch(status: int, body: str) -> None:
-        """Loguje ostrzeżenie przy HTTP 412 — Tuta zwraca to dla niezgodności wersji modelu."""
-        if status == 412:
+        """Loguje ostrzeżenie przy niezgodności wersji:
+        - HTTP 412 — niezgodność wersji modelu,
+        - HTTP 474 (InvalidSoftwareVersionError) — Tuta wymusiła nowszą wersję klienta;
+          zaszyty `cv`/CLIENT_VERSION jest poniżej serwerowego minimum.
+        """
+        if status == 474:
+            logger.warning(
+                "Tuta odrzuciła wersję klienta (HTTP 474 InvalidSoftwareVersionError). "
+                "Zaszyty client=%s jest poniżej serwerowego minimum — ustaw nowszy "
+                "TUTA_CLIENT_VERSION (aktualną wersję odczytasz z app.tuta.com/index.js: "
+                "pole \"versionNumber\") i zrestartuj proxy.",
+                CLIENT_VERSION,
+            )
+        elif status == 412:
             logger.warning(
                 "Możliwa niezgodność wersji API Tuty (HTTP %d). "
                 "Aktualne wersje: sys=%s tutanota=%s storage=%s client=%s. "
@@ -1303,7 +1315,13 @@ class TutaClient:
                             logger.info(f"Tuta WebSocket closed: {msg.type}")
                             break
             except aiohttp.ClientError as e:
-                logger.warning(f"Tuta WebSocket error: {e}")
+                # Handshake 474 = InvalidSoftwareVersionError — Tuta wymusiła nowszą
+                # wersję klienta; loguj czytelną wskazówkę zamiast surowego statusu.
+                status = getattr(e, "status", None)
+                if status == 474:
+                    self._check_version_mismatch(474, "")
+                else:
+                    logger.warning(f"Tuta WebSocket error: {e}")
 
     async def get_mail_body(self, session: Session, body_id: str) -> dict:
         """Pobiera treść maila (stary format - dla kompatybilności)."""

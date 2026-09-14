@@ -1,5 +1,33 @@
 # Changelog
 
+## v1.3.17 — 2026-09-15 — Bump client version (Tuta enforced 474)
+
+Tuta raised its server-side minimum client version. The hardcoded
+`clientVersion=346.260428.0` (build 2026-04-28) started being rejected with
+**474 = `InvalidSoftwareVersionError`**. Symptom: the `/event` WebSocket looped
+logging `Tuta WebSocket error: 474`, REST login also got 474 → IMAP returned NO →
+the mail client kept prompting for the password (even though the password was
+unchanged).
+
+### Fixes
+
+- **Bumped default `TUTA_CLIENT_VERSION`: `346.260428.0` → `359.260904.0`**
+  (current live version read from `app.tuta.com/index.js`, field `versionNumber`,
+  build 2026-09-04). Changed in `tuta/api.py`, `docker/Dockerfile`, `.env.example`,
+  `docker/docker-compose.yml` and README.
+- **Model versions unchanged** (sys=150, tutanota=108, storage=14). 474 gates on the
+  *client* (software) version, independent of model versions; the code reads fields
+  by numeric IDs (additively), so bumping only `clientVersion` is sufficient and the
+  least invasive fix.
+- **`_check_version_mismatch` now detects 474** (alongside 412) and logs a clear
+  hint: set a newer `TUTA_CLIENT_VERSION`, read the current version from
+  `app.tuta.com/index.js`. The WebSocket error handler recognizes a 474 handshake
+  and emits the same message instead of the raw `WebSocket error: 474`.
+
+Immediate unblock without rebuilding the image: set `TUTA_CLIENT_VERSION: "359.260904.0"`
+in the compose `environment` and run `docker compose up -d` (env overrides the
+Dockerfile `ENV`).
+
 ## v1.3.16 — 2026-08-27 — IMAP fixes: STATUS and address formatting
 
 Two correctness fixes (also present in v1.3.13–v1.3.15).

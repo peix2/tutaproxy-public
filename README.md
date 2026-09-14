@@ -101,7 +101,7 @@ python run_webdav.py
 | `TUTA_SYS_VERSION` | `150` | Tuta sys model version (override after API update) |
 | `TUTA_TUTANOTA_VERSION` | `108` | Tuta tutanota model version |
 | `TUTA_STORAGE_VERSION` | `14` | Tuta storage model version |
-| `TUTA_CLIENT_VERSION` | `346.260428.0` | Tuta client version string |
+| `TUTA_CLIENT_VERSION` | `359.260904.0` | Tuta client version string |
 
 ---
 

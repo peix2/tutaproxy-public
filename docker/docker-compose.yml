@@ -24,7 +24,7 @@ services:
       # TUTA_SYS_VERSION: "150"
       # TUTA_TUTANOTA_VERSION: "108"
       # TUTA_STORAGE_VERSION: "14"
-      # TUTA_CLIENT_VERSION: "346.260428.0"
+      # TUTA_CLIENT_VERSION: "359.260904.0"
 
 volumes:
   tuta_cache:
