@@ -1,5 +1,52 @@
 # Changelog
 
+## v1.3.18 — 2026-09-21 — Persistent monotonic UID + NOOP reconciliation (fix for invisible mail)
+
+Reported symptom: the Tuta app shows a new mail, but Thunderbird never sees it — not even
+after "Get Messages" or "Compact". It especially hit replies in long threads from external
+senders. A newer mail would show up; an older one (the reply) would not.
+
+### Diagnosis
+
+Two independent bugs in the IMAP layer (not in `tuta.api` — the API client was correct):
+
+**A. Timestamp-derived UIDs broke IMAP monotonicity.** The UID was computed from the mail
+element's creation timestamp (`tuta_id_to_uid`). Tuta delivers some mail via a "create in a
+transient state → move into folder" path (an UPDATE "moved into folder" event), so a mail
+can appear in the INBOX LATER than another yet carry an EARLIER `receivedDate` → a lower UID.
+`_insert_mail_raw` inserted it in UID order (before the newer one). Thunderbird, after syncing
+the newer mail, only asks `UID FETCH <uidnext>:*`, so it never fetched the lower UID → the
+mail stayed invisible. Confirmed from logs: a reply (uid 1789958607) arrived via "moved INTO
+folder" ~a minute AFTER a test mail (uid 1789958718).
+
+**B. Live delivery used a different source of truth than folder listing.** IDLE push checked
+folder membership via field `1465` (the mail's mailSet), which can lag behind `MailSetEntry`.
+On a mismatch the mail landed in `pending` and was permanently dropped on the next NOOP. NOOP
+never re-listed the folder, so "Get Messages" could not recover the lost mail.
+
+### Fixes
+
+**Persistent UID registry (SQLite, `tuta/cache.py`):**
+- Tables `mail_uid(folder_id, element_id, uid)` + `folder_uidstate(folder_id, uidvalidity, uidnext)`.
+- UID = a per-folder counter assigned on the mail's FIRST observation in that folder, persisted
+  (the `/data` volume survives restarts). A newly appearing mail ALWAYS gets the highest UID →
+  lands at the end → the client fetches it (regardless of `receivedDate`, delivery path, delays,
+  or APPEND import).
+- `UIDVALIDITY` is generated once per folder (epoch). The schema change (from md5) triggers a
+  **one-time resync** in the client (Thunderbird re-downloads folder listings once;
+  `\Flagged`/`\Answered` survive — keyed by `element_id`, not UID).
+- `imap_server`: `MailboxState.uid_map`, `_uid_of()`, SELECT/STATUS via `assign_uids` (first
+  numbering ordered by `receivedDate`); ~24 UID call sites switched to the registry; the md5
+  `_uidvalidity` helper removed.
+
+**NOOP reconciliation (`_reconcile_folder`):**
+- NOOP (throttled to 10s) pulls the folder's `MailSetEntry` list (authoritative membership) and
+  adds any mail missing from the live mailbox — self-healing for lost/late WebSocket events.
+- The insert uses `trust_folder=True` to skip the `1465` check (membership already proven by
+  MailSetEntry). Additions only; removals still come from the "moved OUT" event.
+
+Changes are confined to the IMAP layer + cache — `tuta.api` is untouched.
+
 ## v1.3.17 — 2026-09-15 — Bump client version (Tuta enforced 474)
 
 Tuta raised its server-side minimum client version. The hardcoded

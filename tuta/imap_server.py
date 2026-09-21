@@ -35,7 +35,7 @@ from email.utils import getaddresses as _getaddresses
 
 from .api import TutaClient, TutaAPIError, Session, MailFolder
 from .cache import TutaCache
-from .message_builder import build_rfc2822, get_mail_flags, tuta_id_to_uid
+from .message_builder import build_rfc2822, get_mail_flags
 
 logger = logging.getLogger(__name__)
 
@@ -157,6 +157,26 @@ FOLDER_TYPE_SPECIAL = {
 # Struktury danych sesji
 # ---------------------------------------------------------------------------
 
+def _elem_id(mail_id) -> str:
+    """Wyciąga element_id (część elementowa IdTuple) z pola 99 maila."""
+    if isinstance(mail_id, list) and mail_id:
+        return mail_id[-1]
+    return str(mail_id)
+
+
+def _order_for_assignment(mails: list[dict]) -> list[str]:
+    """Kolejność nadawania UID przy pierwszej synchronizacji: receivedDate (pole 107)
+    rosnąco, tie-break element_id. Daje chronologiczne UID-y dla maili jeszcze
+    niezarejestrowanych; dla już zarejestrowanych kolejność nie ma znaczenia."""
+    def key(m: dict):
+        try:
+            recv = int(m.get("107", 0) or 0)
+        except (TypeError, ValueError):
+            recv = 0
+        return (recv, _elem_id(m.get("99", "")))
+    return [_elem_id(m.get("99", "")) for m in sorted(mails, key=key)]
+
+
 @dataclass
 class MailboxState:
     """Stan wybranej skrzynki (po SELECT)."""
@@ -167,6 +187,9 @@ class MailboxState:
     mail_group_key: Optional[bytes] = None
     # UIDs z flagą \Deleted (czekają na EXPUNGE / CLOSE)
     deleted_uids: set = field(default_factory=set)
+    # Trwałe UID-y IMAP: element_id → uid (z rejestru w TutaCache). Nadane przy SELECT,
+    # uzupełniane przy wstawianiu nowych maili. Jedyne źródło tożsamości UID w sesji.
+    uid_map: dict[str, int] = field(default_factory=dict)
 
     @property
     def exists(self) -> int:
@@ -177,9 +200,14 @@ class MailboxState:
             return self.messages[seq - 1]
         return None
 
+    def uid_of(self, mail_raw: dict) -> Optional[int]:
+        """UID maila z mapy sesji (None jeśli nienadany — nie występuje dla maila
+        obecnego w skrzynce)."""
+        return self.uid_map.get(_elem_id(mail_raw.get("99", "")))
+
     def uid_to_seq(self, uid: int) -> Optional[int]:
         for i, m in enumerate(self.messages):
-            if tuta_id_to_uid(m.get("99", "")) == uid:
+            if self.uid_map.get(_elem_id(m.get("99", ""))) == uid:
                 return i + 1
         return None
 
@@ -222,6 +250,8 @@ class IMAPConnection:
         # Maile z null _ownerEncSessionKey podczas IDLE — element_id → (list_id, element_id).
         # Retry przy NOOP gdy serwer Tuty skończy asynchroniczne szyfrowanie.
         self._pending_mail_ids: dict[str, tuple[str, str]] = {}
+        # Throttle rekoncyliacji NOOP (monotonic ts ostatniego przebiegu).
+        self._last_reconcile: float = 0.0
         # Persystentny bufor eventów — wypełniany przez _bg_event_watcher niezależnie od IDLE.
         # Dzięki temu eventy nie są tracone w przerwach między sesjami IDLE.
         self._event_queue: asyncio.Queue = asyncio.Queue()
@@ -450,7 +480,73 @@ class IMAPConnection:
                 self._untagged(f"{self.mailbox.exists} EXISTS")
                 self._untagged("0 RECENT")
                 await self.writer.drain()
+        # Rekoncyliacja z autorytatywną listą folderu (łata zgubione/spóźnione eventy WS).
+        # Throttling, by nie odpytywać przy każdym częstym NOOP-ie klienta.
+        if self.state == "SELECTED" and self.mailbox and self.session:
+            now = time.monotonic()
+            if now - self._last_reconcile >= 10.0:
+                self._last_reconcile = now
+                await self._reconcile_folder()
         self._ok(tag, "NOOP completed")
+
+    async def _reconcile_folder(self) -> None:
+        """Dociąga do żywej skrzynki maile obecne w folderze wg MailSetEntry, ale
+        brakujące lokalnie (zgubiony/spóźniony event WS albo odrzucony przez check 1465).
+        MailSetEntry jest autorytatywnym źródłem członkostwa, więc insert pomija 1465.
+        Tylko DODAWANIE — usunięcia obsługuje ścieżka 'moved OUT' na evencie."""
+        try:
+            entries = await self.client._get_mailset_entries(
+                self.session, self.mailbox.folder.mail_list_id, start=None, count=1000
+            )
+        except Exception as e:
+            logger.debug(f"[{self.peer}] reconcile: _get_mailset_entries: {e}")
+            return
+
+        # (bag, elem) chronologicznie — entries są newest-first, więc odwracamy,
+        # by ewentualne dodania dostały UID-y w porządku rosnącym po receivedDate.
+        refs: list[tuple[str, str]] = []
+        seen: set[str] = set()
+        for e in reversed(entries):
+            raw = e.get("1456", [])
+            ref = None
+            if isinstance(raw, list) and raw:
+                first = raw[0]
+                if isinstance(first, list) and len(first) >= 2:
+                    ref = (first[0], first[1])
+                elif isinstance(first, str) and len(raw) >= 2:
+                    ref = (raw[0], raw[1])
+            if ref and ref[1] not in seen:
+                seen.add(ref[1])
+                refs.append(ref)
+
+        have = {_elem_id(m.get("99", "")) for m in self.mailbox.messages}
+        missing = [(bag, elem) for (bag, elem) in refs if elem not in have]
+        if not missing:
+            return
+
+        added = 0
+        for bag, elem in missing:
+            try:
+                mail_raw = await self.client.get_single_mail(self.session, bag, elem)
+            except Exception as e:
+                logger.debug(f"[{self.peer}] reconcile fetch {elem}: {e}")
+                continue
+            # Mail jeszcze przetwarzany po stronie Tuty → pomiń, następny NOOP spróbuje
+            if not (self._is_mail_decryptable(mail_raw) and self._is_mail_decryption_ready(mail_raw)):
+                continue
+            flagged, answered = self.cache.get_local_flags(elem)
+            if flagged:
+                mail_raw["_flagged"] = True
+            if answered:
+                mail_raw["_answered"] = True
+            if self._insert_mail_raw(mail_raw, trust_folder=True):
+                added += 1
+
+        if added:
+            self._untagged(f"{self.mailbox.exists} EXISTS")
+            self._untagged("0 RECENT")
+            await self.writer.drain()
+            logger.info(f"[{self.peer}] NOOP reconcile: dodano {added}, EXISTS={self.mailbox.exists}")
 
     async def _cmd_logout(self, tag: str, args: str) -> None:
         self._stop_event_watcher()
@@ -677,6 +773,19 @@ class IMAPConnection:
         # Zwracamy te same foldery co LIST (subskrypcja jest automatyczna)
         await self._cmd_list(tag, args)
 
+    def _uid_of(self, mail_raw: dict) -> int:
+        """Trwały UID maila w bieżącej skrzynce. Czyta z mapy sesji; przy braku
+        (świeżo wstawiony mail) dociąga z rejestru i zapamiętuje w mapie."""
+        elem = _elem_id(mail_raw.get("99", ""))
+        mb = self.mailbox
+        if mb is None:
+            return self.cache.uid_for("", elem)  # defensywnie — poza ścieżkami UID
+        uid = mb.uid_map.get(elem)
+        if uid is None:
+            uid = self.cache.uid_for(mb.folder.id, elem)
+            mb.uid_map[elem] = uid
+        return uid
+
     async def _cmd_select(self, tag: str, args: str, readonly: bool = False) -> None:
         if not await self._require_auth(tag):
             return
@@ -696,9 +805,10 @@ class IMAPConnection:
         mails = await self.client.get_mails_in_folder(
             self.session, target.mail_list_id
         )
-        # RFC 3501 §2.3.1.1: UIDs muszą być ściśle rosnące wraz z numerem seq.
-        # CRC32 nie gwarantuje tego porządku — sortujemy explicite.
-        mails.sort(key=lambda m: tuta_id_to_uid(m.get("99", "")))
+        # Trwałe UID-y z rejestru: nadaj (dla nowych w kolejności receivedDate)
+        # i posortuj maile rosnąco po UID — numer seq = pozycja (RFC 3501 §2.3.1.1).
+        uid_map = self.cache.assign_uids(target.id, _order_for_assignment(mails))
+        mails.sort(key=lambda m: uid_map.get(_elem_id(m.get("99", "")), 0))
 
         # Inject lokalnych flag z SQLite (persystencja \Flagged, \Answered między restartami)
         for _m in mails:
@@ -717,24 +827,21 @@ class IMAPConnection:
             folder=target,
             messages=mails,
             mail_group_key=mail_group_key,
+            uid_map=uid_map,
         )
         self._msg_cache.clear()
         self.state = "SELECTED"
         # Uruchom persystentny watcher (lub zostaw działający jeśli już działa)
         self._start_event_watcher()
 
-        # UIDNEXT musi być > wszystkich istniejących UID (RFC 3501 §2.3.1.1)
-        if self.mailbox.messages:
-            max_uid = max(tuta_id_to_uid(m.get("99", "")) for m in self.mailbox.messages)
-            uid_next = (max_uid + 1) & 0xFFFFFFFF
-        else:
-            uid_next = 1
+        # UIDNEXT z rejestru (== max nadany UID + 1, rośnie monotonicznie)
+        uid_next = self.cache.get_uidnext(target.id)
 
         # Odpowiedź SELECT (RFC 3501 §6.3.1)
         self._untagged(f"{self.mailbox.exists} EXISTS")
         self._untagged("0 RECENT")
         self._untagged(r"OK [UNSEEN 0] No unseen messages")
-        self._untagged(f"OK [UIDVALIDITY {_uidvalidity(target.id)}] UIDs valid")
+        self._untagged(f"OK [UIDVALIDITY {self.cache.get_uidvalidity(target.id)}] UIDs valid")
         self._untagged(f"OK [UIDNEXT {uid_next}] Predicted next UID")
         self._untagged(r"FLAGS (\Answered \Flagged \Deleted \Seen \Draft)")
         self._untagged(r"OK [PERMANENTFLAGS (\Answered \Flagged \Seen \Deleted \*)] Permanent flags")
@@ -767,12 +874,10 @@ class IMAPConnection:
 
         msg_count = len(mails)
         unseen = sum(1 for mail in mails if mail.get("109", "1") == "1")
-        uid_validity = _uidvalidity(target.id)
-        if mails:
-            max_uid = max(tuta_id_to_uid(mail.get("99", "")) for mail in mails)
-            uid_next = (max_uid + 1) & 0xFFFFFFFF
-        else:
-            uid_next = 1
+        # Zarejestruj UID-y (spójnie z SELECT) i odczytaj UIDVALIDITY/UIDNEXT z rejestru
+        self.cache.assign_uids(target.id, _order_for_assignment(mails))
+        uid_validity = self.cache.get_uidvalidity(target.id)
+        uid_next = self.cache.get_uidnext(target.id)
 
         parts = []
         for item in requested:
@@ -822,7 +927,7 @@ class IMAPConnection:
         # Dla UID FETCH: * = największy UID w skrzynce (nie liczba wiadomości!)
         if uid_mode:
             max_val = max(
-                (tuta_id_to_uid(m.get("99", "")) for m in self.mailbox.messages),
+                (self._uid_of(m) for m in self.mailbox.messages),
                 default=1,
             )
         else:
@@ -834,7 +939,7 @@ class IMAPConnection:
                 continue
 
             if uid_mode:
-                uid = tuta_id_to_uid(mail_raw.get("99", ""))
+                uid = self._uid_of(mail_raw)
                 if not _in_seq_set(uid, seq_set_str, max_val):
                     continue
             else:
@@ -846,7 +951,7 @@ class IMAPConnection:
             except Exception as e:
                 logger.warning(f"[{self.peer}] FETCH seq={seq} error: {e}")
                 # Wyślij minimalną odpowiedź — Thunderbird musi znać każdy seq numer
-                uid = tuta_id_to_uid(mail_raw.get("99", ""))
+                uid = self._uid_of(mail_raw)
                 flags = get_mail_flags(mail_raw)
                 flags_str = " ".join(flags) if flags else ""
                 self._send(f"* {seq} FETCH (UID {uid} FLAGS ({flags_str}))")
@@ -863,7 +968,7 @@ class IMAPConnection:
     ) -> None:
         mail_id = mail_raw.get("99", ["", ""])
         element_id = mail_id[-1] if isinstance(mail_id, list) else str(mail_id)
-        uid = tuta_id_to_uid(mail_raw.get("99", ""))
+        uid = self._uid_of(mail_raw)
         logger.debug(f"[{self.peer}] FETCH seq={seq} uid={uid} element_id={element_id} items={items}")
         flags = get_mail_flags(mail_raw)
         flags_str = " ".join(flags) if flags else ""
@@ -1164,7 +1269,7 @@ class IMAPConnection:
         if criteria in ("ALL", "UNDELETED", "NOT DELETED"):
             # Zwróć wszystkie wiadomości które nie są \Deleted
             for mail_raw in (self.mailbox.messages if self.mailbox else []):
-                uid = tuta_id_to_uid(mail_raw.get("99", ""))
+                uid = self._uid_of(mail_raw)
                 if uid not in self.mailbox.deleted_uids:
                     result_uids.append(uid)
         # Dla innych kryteriów (np. HEADER Message-ID) zwracamy pusty wynik —
@@ -1283,14 +1388,16 @@ class IMAPConnection:
             self._no(tag, f"APPEND failed: {e}")
             return
 
-        uid = tuta_id_to_uid([draft_list_id, draft_elem_id])
-        uv = _uidvalidity(target_folder.id)
+        # Trwały UID draftu w folderze docelowym (najwyższy — draft jest najnowszy)
+        uid = self.cache.uid_for(target_folder.id, draft_elem_id)
+        uv = self.cache.get_uidvalidity(target_folder.id)
         logger.info(f"[{self.peer}] APPEND Drafts → draft_elem={draft_elem_id} uid={uid}")
 
         # Pobierz świeżo utworzony draft i dodaj do mailbox jeśli Drafts jest aktualnie wybrane
         if self.mailbox and self.mailbox.folder.id == target_folder.id:
             try:
                 new_mail = await self.client.get_single_mail(self.session, draft_list_id, draft_elem_id)
+                self.mailbox.uid_map[draft_elem_id] = uid
                 self.mailbox.messages.append(new_mail)
                 count = len(self.mailbox.messages)
                 self._untagged(f"{count} EXISTS")
@@ -1621,7 +1728,7 @@ class IMAPConnection:
 
         if uid_mode:
             max_val = max(
-                (tuta_id_to_uid(mr.get("99", "")) for mr in self.mailbox.messages),
+                (self._uid_of(mr) for mr in self.mailbox.messages),
                 default=1,
             )
         else:
@@ -1639,7 +1746,7 @@ class IMAPConnection:
             mail_raw = self.mailbox.seq_to_mail(seq)
             if mail_raw is None:
                 continue
-            uid = tuta_id_to_uid(mail_raw.get("99", ""))
+            uid = self._uid_of(mail_raw)
             check_val = uid if uid_mode else seq
             if not _in_seq_set(check_val, seq_set_str, max_val):
                 continue
@@ -1718,7 +1825,7 @@ class IMAPConnection:
                 mail_raw = self.mailbox.seq_to_mail(seq)
                 if mail_raw is None:
                     continue
-                uid = tuta_id_to_uid(mail_raw.get("99", ""))
+                uid = self._uid_of(mail_raw)
                 flags = list(get_mail_flags(mail_raw))
                 if uid in self.mailbox.deleted_uids and r"\Deleted" not in flags:
                     flags.append(r"\Deleted")
@@ -1757,7 +1864,7 @@ class IMAPConnection:
 
         if uid_mode:
             max_val = max(
-                (tuta_id_to_uid(mr.get("99", "")) for mr in self.mailbox.messages),
+                (self._uid_of(mr) for mr in self.mailbox.messages),
                 default=1,
             )
         else:
@@ -1768,7 +1875,7 @@ class IMAPConnection:
             mail_raw = self.mailbox.seq_to_mail(seq)
             if mail_raw is None:
                 continue
-            uid = tuta_id_to_uid(mail_raw.get("99", ""))
+            uid = self._uid_of(mail_raw)
             check_val = uid if uid_mode else seq
             if _in_seq_set(check_val, seq_set_str, max_val):
                 to_copy.append((seq, mail_raw))
@@ -1815,7 +1922,7 @@ class IMAPConnection:
             self._send(f"* {seq} EXPUNGE")
 
         self.mailbox.messages = [mr for mr in self.mailbox.messages if id(mr) not in copy_obj_ids]
-        self.mailbox.deleted_uids -= {tuta_id_to_uid(mr.get("99", "")) for _, mr in to_copy}
+        self.mailbox.deleted_uids -= {self._uid_of(mr) for _, mr in to_copy}
 
         logger.info(f"[{self.peer}] COPY {len(to_copy)} mail(s) → '{folder_name}' (move)")
         self._ok(tag, "COPY completed")
@@ -1937,34 +2044,43 @@ class IMAPConnection:
                 return True
         return False
 
-    def _insert_mail_raw(self, mail_raw: dict) -> bool:
+    def _insert_mail_raw(self, mail_raw: dict, trust_folder: bool = False) -> bool:
         """
         Wstawia mail do aktualnej skrzynki w kolejności UID.
         Zwraca True jeśli mail pasuje do bieżącego folderu i został dodany, False wpp.
         Nie wysyła EXISTS — wywołujący odpowiada za notyfikację.
+
+        trust_folder=True pomija check pola 1465 — członkostwo w folderze zostało już
+        potwierdzone przez MailSetEntry (rekoncyliacja NOOP). Pole 1465 potrafi być
+        opóźnione względem MailSetEntry i wtedy błędnie odrzucało maila.
         """
         if not self.mailbox:
             return False
-        # 1465 = mailSet — sprawdź czy mail należy do zaznaczonego folderu
-        folder_refs = mail_raw.get("1465", [])
-        in_folder = any(
-            isinstance(ref, list) and len(ref) >= 2 and ref[1] == self.mailbox.folder.id
-            for ref in folder_refs
-        )
-        if not in_folder:
-            mid = mail_raw.get("99", "?")
-            logger.debug(
-                "[insert] mail %s odrzucony: folder.id=%s, 1465=%r",
-                mid, self.mailbox.folder.id, folder_refs,
+        if not trust_folder:
+            # 1465 = mailSet — sprawdź czy mail należy do zaznaczonego folderu
+            folder_refs = mail_raw.get("1465", [])
+            in_folder = any(
+                isinstance(ref, list) and len(ref) >= 2 and ref[1] == self.mailbox.folder.id
+                for ref in folder_refs
             )
-            return False
-        uid = tuta_id_to_uid(mail_raw.get("99", ""))
+            if not in_folder:
+                mid = mail_raw.get("99", "?")
+                logger.debug(
+                    "[insert] mail %s odrzucony: folder.id=%s, 1465=%r",
+                    mid, self.mailbox.folder.id, folder_refs,
+                )
+                return False
+        elem = _elem_id(mail_raw.get("99", ""))
         # Pomiń jeśli już w skrzynce (np. podwójny event)
-        if any(tuta_id_to_uid(m.get("99", "")) == uid for m in self.mailbox.messages):
+        if any(_elem_id(m.get("99", "")) == elem for m in self.mailbox.messages):
             return False
+        # Nowy mail dostaje UID = uidnext (najwyższy) → ląduje na końcu → klient go pobierze.
+        # Rejestr zwraca też stary UID przy rzadkim powrocie maila do folderu.
+        uid = self.cache.uid_for(self.mailbox.folder.id, elem)
+        self.mailbox.uid_map[elem] = uid
         insert_pos = len(self.mailbox.messages)
         for i, m in enumerate(self.mailbox.messages):
-            if tuta_id_to_uid(m.get("99", "")) > uid:
+            if (self.mailbox.uid_map.get(_elem_id(m.get("99", ""))) or 0) > uid:
                 insert_pos = i
                 break
         self.mailbox.messages.insert(insert_pos, mail_raw)
@@ -2024,7 +2140,7 @@ class IMAPConnection:
             self._send(f"* {count} EXISTS")
             self._send(f"* 0 RECENT")
             await self.writer.drain()
-            uid = tuta_id_to_uid(mail_raw.get("99", ""))
+            uid = self._uid_of(mail_raw)
             logger.info(f"[{self.peer}] IDLE: new mail uid={uid}, folder={self.mailbox.folder.id}, EXISTS={count}")
         else:
             # Mail dekrypowalny ale nie pasuje do aktualnego folderu — może timing lub
@@ -2070,20 +2186,17 @@ class IMAPConnection:
                     self.peer, element_id,
                 )
                 return
-            uid = tuta_id_to_uid(updated.get("99", ""))
-            insert_pos = len(self.mailbox.messages)
-            for i, m in enumerate(self.mailbox.messages):
-                if tuta_id_to_uid(m.get("99", "")) > uid:
-                    insert_pos = i
-                    break
-            self.mailbox.messages.insert(insert_pos, updated)
-            count = self.mailbox.exists
-            self._send(f"* {count} EXISTS")
-            logger.info(f"[{self.peer}] IDLE: mail moved INTO folder uid={uid}, EXISTS={count}")
+            # Wstawienie przez _insert_mail_raw — nadaje trwały UID (najwyższy) i mapuje;
+            # nowy mail ląduje na końcu, więc klient go pobierze mimo wcześniejszej daty.
+            if self._insert_mail_raw(updated):
+                count = self.mailbox.exists
+                self._send(f"* {count} EXISTS")
+                uid = self.mailbox.uid_of(updated)
+                logger.info(f"[{self.peer}] IDLE: mail moved INTO folder uid={uid}, EXISTS={count}")
         elif not in_current and local_idx is not None:
             # Mail opuścił ten folder (przeniesiony gdzie indziej) → EXPUNGE
             seq = local_idx + 1
-            uid = tuta_id_to_uid(self.mailbox.messages[local_idx].get("99", ""))
+            uid = self._uid_of(self.mailbox.messages[local_idx])
             mid = self.mailbox.messages[local_idx].get("99", ["", ""])
             elem_id = mid[-1] if isinstance(mid, list) else str(mid)
             self._msg_cache.pop(elem_id, None)
@@ -2096,7 +2209,7 @@ class IMAPConnection:
             self.mailbox.messages[local_idx] = updated
             seq = local_idx + 1
             flags = list(get_mail_flags(updated))
-            uid = tuta_id_to_uid(updated.get("99", ""))
+            uid = self._uid_of(updated)
             if uid in self.mailbox.deleted_uids:
                 flags.append(r"\Deleted")
             self._send(f"* {seq} FETCH (FLAGS ({' '.join(flags)}))")
@@ -2137,7 +2250,7 @@ class IMAPConnection:
             mail_raw = self.mailbox.seq_to_mail(seq)
             if mail_raw is None:
                 continue
-            uid = tuta_id_to_uid(mail_raw.get("99", ""))
+            uid = self._uid_of(mail_raw)
             if uid in self.mailbox.deleted_uids:
                 to_expunge.append((seq, mail_raw))
 
@@ -2460,16 +2573,6 @@ def decode_mutf7(s: str) -> str:
             result.append(s[i])
             i += 1
     return "".join(result)
-
-
-def _uidvalidity(folder_id: str) -> int:
-    """Stabilna wartość UIDVALIDITY z ID folderu.
-    v3: zmiana schematu UID z CRC32 na timestamp z GeneratedId (2026-05-12).
-    Zmiana prefixu wymusza porzucenie lokalnego cache UID przez Thunderbirda.
-    """
-    import hashlib
-    h = hashlib.md5(f"v3:{folder_id}".encode()).digest()
-    return int.from_bytes(h[:4], "big")
 
 
 def _imap_date(dt: datetime) -> str:
