@@ -146,6 +146,58 @@ class TestAesCbcThenHmac:
             aes_decrypt_tuta(key, bogus)
 
 
+class TestKeyPaddingNoStrip:
+    """Regresja issue #3 — klucze symetryczne szyfrowane bez PKCS7.
+
+    Tuta szyfruje klucze (group/session/bucket) przez encryptKey → PaddingStandard.None.
+    Zdejmowanie PKCS7 z surowego klucza ucina te, których końcowe bajty przypadkiem
+    wyglądają jak poprawny padding (~1/256). remove_padding=False zwraca pełny klucz.
+    """
+
+    def test_key_ending_0x01_not_truncated(self):
+        """Klucz 32B kończący się 0x01: bez remove_padding=False zostałby ucięty do 31B."""
+        kek = os.urandom(32)
+        key_material = b"\x00" * 31 + b"\x01"
+        ct = aes_encrypt_tuta(kek, key_material, add_padding=False)
+        # Tryb klucza — pełne 32B.
+        assert aes_decrypt_tuta(kek, ct, remove_padding=False) == key_material
+        # Tryb wartości (domyślny) — PKCS7 ucina ostatni bajt → błędny klucz.
+        assert aes_decrypt_tuta(kek, ct) == b"\x00" * 31
+        assert len(aes_decrypt_tuta(kek, ct)) == 31
+
+    def test_key_ending_double_0x02_not_truncated(self):
+        """Klucz 32B kończący się 0x02 0x02: padding wartości uciąłby 2 bajty."""
+        kek = os.urandom(32)
+        key_material = b"\x11" * 30 + b"\x02\x02"
+        ct = aes_encrypt_tuta(kek, key_material, add_padding=False)
+        assert aes_decrypt_tuta(kek, ct, remove_padding=False) == key_material
+        assert len(aes_decrypt_tuta(kek, ct)) == 30
+
+    def test_all_last_bytes_roundtrip(self):
+        """Dla każdego możliwego ostatniego bajtu klucz 32B wraca w całości w trybie klucza."""
+        kek = os.urandom(32)
+        for last in range(256):
+            key_material = os.urandom(31) + bytes([last])
+            ct = aes_encrypt_tuta(kek, key_material, add_padding=False)
+            assert aes_decrypt_tuta(kek, ct, remove_padding=False) == key_material
+
+    def test_key_wrappers_use_no_padding(self):
+        """decrypt_mail_group_key/_session_key muszą zwracać pełny klucz (bez unpaddingu)."""
+        from tuta.crypto import decrypt_mail_group_key, decrypt_mail_session_key
+        kek = os.urandom(32)
+        key_material = b"\x00" * 31 + b"\x01"
+        ct = aes_encrypt_tuta(kek, key_material, add_padding=False)
+        assert decrypt_mail_group_key(kek, ct) == key_material
+        assert decrypt_mail_session_key(kek, ct) == key_material
+
+    def test_value_mode_still_strips(self):
+        """Tryb wartości (domyślny) nadal poprawnie zdejmuje PKCS7 z paddowanych danych."""
+        key = os.urandom(32)
+        value = b"temat wiadomosci"
+        ct = aes_encrypt_tuta(key, value)  # add_padding=True
+        assert aes_decrypt_tuta(key, ct) == value
+
+
 class TestMailUID:
     def _decoder(self):
         from tuta.mail_decoder import MailDecoder

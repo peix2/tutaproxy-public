@@ -242,7 +242,7 @@ def decrypt_user_group_key(
     
     version = encrypted_group_key[0]
     if version == 0x01:  # AesCbcThenHmac
-        return aes_decrypt_tuta(session_key, encrypted_group_key)
+        return aes_decrypt_tuta(session_key, encrypted_group_key, remove_padding=False)
     elif version == CRYPTO_PROTO_VERSION_AES256:  # 0x02
         return aes256_decrypt(session_key, encrypted_group_key)
     else:
@@ -338,7 +338,7 @@ def aes128_decrypt_fixed_iv(key: bytes, ciphertext: bytes) -> bytes:
 # AesCbcThenHmac — główny format szyfrowania Tuty
 # ---------------------------------------------------------------------------
 
-def aes_decrypt_tuta(key: bytes, enc_data: bytes) -> bytes:
+def aes_decrypt_tuta(key: bytes, enc_data: bytes, remove_padding: bool = True) -> bytes:
     """
     Odszyfrowuje dane w formacie AesCbcThenHmac (version byte 0x01).
 
@@ -348,10 +348,20 @@ def aes_decrypt_tuta(key: bytes, enc_data: bytes) -> bytes:
     Weryfikacja HMAC: tryb strict — mismatch rzuca ValueError.
     Kill-switch: ustaw TUTA_SKIP_HMAC=1 aby pominąć (loguje WARNING).
 
+    remove_padding:
+      - True  (domyślnie) — dane szyfrowane z PKCS7 (wartości, treść, klucze
+        prywatne ECC/Kyber/RSA): zdejmij padding. Odpowiednik encryptBytes/
+        decryptBytes (PaddingStandard.Pkcs5) w oficjalnym kliencie.
+      - False — KLUCZE symetryczne AES (group/session/bucket keys) szyfrowane
+        BEZ paddingu (encryptKey/decryptKey → PaddingStandard.None). Zdejmowanie
+        paddingu z surowego klucza ucina ~1/256 kluczy, których ostatnie bajty
+        przypadkiem wyglądają jak poprawny PKCS7 (np. 32B → 31B) → błędny klucz,
+        HMAC mismatch treści, puste tematy, znikające eventy. Zob. issue #3.
+
     Używane do odszyfrowywania:
-      - mail_group_key z membership['27'] (kluczem user_group_key)
-      - mail_session_key z mail['102'] (kluczem mail_group_key)
-      - treści maila z body['1276'] (kluczem mail_session_key)
+      - mail_group_key z membership['27'] (kluczem user_group_key) — klucz, False
+      - mail_session_key z mail['102'] (kluczem mail_group_key) — klucz, False
+      - treści maila z body['1276'] (kluczem mail_session_key) — wartość, True
     """
     if enc_data[0] != 0x01:
         raise ValueError(f"Oczekiwano version byte 0x01, dostałem {hex(enc_data[0])}")
@@ -383,6 +393,9 @@ def aes_decrypt_tuta(key: bytes, enc_data: bytes) -> bytes:
 
     cipher = Cipher(algorithms.AES(enc_key), modes.CBC(iv))
     raw = cipher.decryptor().update(ciphertext) + b""
+    # Klucze symetryczne szyfrowane bez paddingu — zwróć surowe bajty.
+    if not remove_padding:
+        return raw
     # Usuń PKCS7 padding jeśli jest
     try:
         unpadder = padding.PKCS7(128).unpadder()
@@ -419,13 +432,13 @@ def aes_encrypt_tuta(key: bytes, plaintext: bytes, add_padding: bool = True) -> 
 
 
 def decrypt_mail_group_key(user_group_key: bytes, enc_mail_group_key: bytes) -> bytes:
-    """Odszyfrowuje klucz grupy mail (pole 27 w membership)."""
-    return aes_decrypt_tuta(user_group_key, enc_mail_group_key)
+    """Odszyfrowuje klucz grupy mail (pole 27 w membership). Klucz → bez paddingu."""
+    return aes_decrypt_tuta(user_group_key, enc_mail_group_key, remove_padding=False)
 
 
 def decrypt_mail_session_key(mail_group_key: bytes, enc_session_key: bytes) -> bytes:
-    """Odszyfrowuje klucz sesji maila (pole 102 w mail)."""
-    return aes_decrypt_tuta(mail_group_key, enc_session_key)
+    """Odszyfrowuje klucz sesji maila (pole 102 w mail). Klucz → bez paddingu."""
+    return aes_decrypt_tuta(mail_group_key, enc_session_key, remove_padding=False)
 
 
 def decrypt_mail_body(mail_session_key: bytes, enc_body: bytes) -> bytes:
@@ -446,10 +459,10 @@ def resolve_bucket_session_key(mail_group_key: bytes, group_enc_bucket_key: byte
         bucket_key = aes128_decrypt(mail_group_key, group_enc_bucket_key)
     elif len(mail_group_key) == TUTA_AES256_KEY_LEN:
         # AesCbcThenHmac: SHA-512(key)[:32] jako klucz AES, HMAC na końcu
-        bucket_key = aes_decrypt_tuta(mail_group_key, group_enc_bucket_key)
+        bucket_key = aes_decrypt_tuta(mail_group_key, group_enc_bucket_key, remove_padding=False)
     else:
         raise ValueError(f"Nieobsługiwany rozmiar mail_group_key: {len(mail_group_key)}B")
-    return aes_decrypt_tuta(bucket_key, bucket_enc_session_key)
+    return aes_decrypt_tuta(bucket_key, bucket_enc_session_key, remove_padding=False)
 
 
 # ---------------------------------------------------------------------------

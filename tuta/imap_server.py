@@ -1092,7 +1092,7 @@ class IMAPConnection:
                 mail_elem_id = mail_id[1] if isinstance(mail_id, list) and len(mail_id) > 1 else str(mail_id)
                 for e in (entry.get("2048") or []):
                     if e.get("2041") == mail_elem_id:
-                        sk = aes_decrypt_tuta(bucket_key, _b64.b64decode(e["2042"]))
+                        sk = aes_decrypt_tuta(bucket_key, _b64.b64decode(e["2042"]), remove_padding=False)
                         logger.debug("TutaCrypt PQ resolved dla maila %s", mail_raw.get("99", "?"))
                         return sk
                 logger.warning("Brak pasującego elemId %s w 1310[0]['2048']", mail_elem_id)

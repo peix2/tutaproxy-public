@@ -942,7 +942,7 @@ class TutaClient:
             mail_key = None
             for e in (entry.get("2048") or []):
                 if e.get("2041") == mail_elem_id:
-                    mail_key = aes_decrypt_tuta(bucket_key, base64.b64decode(e["2042"]))
+                    mail_key = aes_decrypt_tuta(bucket_key, base64.b64decode(e["2042"]), remove_padding=False)
                     break
             if mail_key is None:
                 raise TutaAPIError(0, f"Brak pasującego elementId {mail_elem_id!r} w 1310[0]['2048']")
@@ -1235,7 +1235,7 @@ class TutaClient:
                             f"Brak klucza pliku {element_id!r} w 1310[0]['2048']"
                         )
                     file_key = aes_decrypt_tuta(
-                        bucket_key, base64.b64decode(enc_file_sk_b64)
+                        bucket_key, base64.b64decode(enc_file_sk_b64), remove_padding=False
                     )
             except Exception as e:
                 logger.warning(f"Nie udało się odszyfrować klucza pliku {element_id}: {e}")
@@ -1424,7 +1424,7 @@ class TutaClient:
 
         # ── 1. Zmiana nazwy: PUT mailset, parentFolder = stary (nie zmieniamy!) ──
         enc_sk = base64.b64decode(folder.owner_enc_session_key)
-        folder_sk = aes_decrypt_tuta(mail_group_key, enc_sk)
+        folder_sk = aes_decrypt_tuta(mail_group_key, enc_sk, remove_padding=False)
         name_enc = aes_encrypt_tuta(folder_sk, new_bare_name.encode("utf-8"))
         original_parent_ref = folder.parent_folder_raw if folder.parent_folder_raw is not None else []
         body: dict = {
@@ -1873,11 +1873,11 @@ class TutaClient:
 
         # Odszyfruj ext_user_group_key używając naszego user_group_key
         enc_ext_user_key = base64.b64decode(ext_user_group.get("11", "") or "")
-        ext_user_group_key = aes_decrypt_tuta(session.user_group_key, enc_ext_user_key)
+        ext_user_group_key = aes_decrypt_tuta(session.user_group_key, enc_ext_user_key, remove_padding=False)
 
         # Odszyfruj ext_mail_group_key używając ext_user_group_key
         enc_ext_mail_key = base64.b64decode(ext_mail_group.get("11", "") or "")
-        ext_mail_group_key = aes_decrypt_tuta(ext_user_group_key, enc_ext_mail_key)
+        ext_mail_group_key = aes_decrypt_tuta(ext_user_group_key, enc_ext_mail_key, remove_padding=False)
 
         return ext_user_group_key, ext_mail_group_key
 
@@ -2407,7 +2407,7 @@ class TutaClient:
                 g = m.get("29", "")
                 group_id = g[-1] if isinstance(g, list) else g
                 key_version = str(m.get("2246", "0") or "0")
-                cal_group_key = aes_decrypt_tuta(session.user_group_key, enc_key)
+                cal_group_key = aes_decrypt_tuta(session.user_group_key, enc_key, remove_padding=False)
                 logger.debug("calendar_group_id=%s kv=%s", group_id, key_version)
                 return group_id, cal_group_key, key_version
         raise TutaAPIError(0, "Nie znaleziono grupy kalendarza (groupType=9)")
@@ -2476,7 +2476,7 @@ class TutaClient:
             if not enc_sk_b64:
                 return None
             session_key = aes_decrypt_tuta(
-                cal_group_key, base64.b64decode(enc_sk_b64)
+                cal_group_key, base64.b64decode(enc_sk_b64), remove_padding=False
             )
 
             def dec_str(fid: str) -> str:
@@ -2799,7 +2799,7 @@ class TutaClient:
                 g = m.get("29", "")
                 group_id = g[-1] if isinstance(g, list) else g
                 key_version = str(m.get("2246", "0") or "0")
-                contact_group_key = aes_decrypt_tuta(session.user_group_key, enc_key)
+                contact_group_key = aes_decrypt_tuta(session.user_group_key, enc_key, remove_padding=False)
                 break
         if contact_group_key is None or not group_id:
             logger.error("get_contact_group_info: brak groupType=6, dostępne: %s",
@@ -2866,7 +2866,7 @@ class TutaClient:
             enc_sk_b64 = raw.get("69", "")
             if not enc_sk_b64:
                 return None
-            sk = aes_decrypt_tuta(contact_group_key, base64.b64decode(enc_sk_b64))
+            sk = aes_decrypt_tuta(contact_group_key, base64.b64decode(enc_sk_b64), remove_padding=False)
 
             def d(fid: str) -> str:
                 v = raw.get(fid, "")
@@ -3090,7 +3090,7 @@ class TutaClient:
         # Reużywamy istniejący klucz sesji zamiast generować nowy
         enc_sk_b64 = raw.get("69", "")
         if enc_sk_b64:
-            sk = aes_decrypt_tuta(contact_group_key, base64.b64decode(enc_sk_b64))
+            sk = aes_decrypt_tuta(contact_group_key, base64.b64decode(enc_sk_b64), remove_padding=False)
             owner_enc_sk = base64.b64decode(enc_sk_b64)
         else:
             sk = os.urandom(32)
@@ -3213,7 +3213,7 @@ class TutaClient:
                 g = m.get("29", "")
                 group_id = g[-1] if isinstance(g, list) else g
                 key_version = str(m.get("2246", "0") or "0")
-                group_key = aes_decrypt_tuta(session.user_group_key, base64.b64decode(enc_key_b64))
+                group_key = aes_decrypt_tuta(session.user_group_key, base64.b64decode(enc_key_b64), remove_padding=False)
                 logger.debug("drive group_id=%s kv=%s", group_id[:12], key_version)
                 return group_id, group_key, key_version
         raise TutaAPIError(0, "Brak grupy Drive (groupType=7) — konto bez dostępu do Tuta Drive")
@@ -3270,7 +3270,7 @@ class TutaClient:
             enc_sk_b64 = raw.get("6", "")
             if not enc_sk_b64:
                 return None
-            sk = aes_decrypt_tuta(group_key, base64.b64decode(enc_sk_b64))
+            sk = aes_decrypt_tuta(group_key, base64.b64decode(enc_sk_b64), remove_padding=False)
             name_enc = raw.get("9", "")
             name = aes_decrypt_tuta(sk, base64.b64decode(name_enc)).decode("utf-8") if name_enc else ""
             folder_type = str(raw.get("8", "0"))
@@ -3307,7 +3307,7 @@ class TutaClient:
             enc_sk_b64 = raw.get("20", "")
             if not enc_sk_b64:
                 return None
-            sk = aes_decrypt_tuta(group_key, base64.b64decode(enc_sk_b64))
+            sk = aes_decrypt_tuta(group_key, base64.b64decode(enc_sk_b64), remove_padding=False)
             name_enc = raw.get("22", "")
             name = aes_decrypt_tuta(sk, base64.b64decode(name_enc)).decode("utf-8") if name_enc else ""
             mime_enc = raw.get("24", "")
@@ -3478,7 +3478,7 @@ class TutaClient:
 
         # Odszyfruj klucz sesji pliku
         enc_sk_b64 = drive_file.raw.get("20", "")
-        file_sk = aes_decrypt_tuta(group_key, base64.b64decode(enc_sk_b64))
+        file_sk = aes_decrypt_tuta(group_key, base64.b64decode(enc_sk_b64), remove_padding=False)
 
         # Pobierz i odszyfruj każdy blob
         from .crypto import aes_decrypt_tuta as _aes_dec
@@ -3733,7 +3733,7 @@ class TutaClient:
         # Odszyfruj klucz sesji elementu
         sk_field = "20" if is_file else "6"
         enc_sk_b64 = item_raw.get(sk_field, "")
-        item_sk = aes_decrypt_tuta(group_key, base64.b64decode(enc_sk_b64))
+        item_sk = aes_decrypt_tuta(group_key, base64.b64decode(enc_sk_b64), remove_padding=False)
 
         # Zaszyfruj nową nazwę kluczem sesji elementu
         enc_new_name = aes_encrypt_tuta(item_sk, new_name.encode("utf-8"))
@@ -3769,7 +3769,7 @@ class TutaClient:
             new_name = (rename_map or {}).get(f.name)
             if new_name:
                 enc_sk_b64 = f.raw.get("20", "")
-                item_sk = aes_decrypt_tuta(group_key, base64.b64decode(enc_sk_b64))
+                item_sk = aes_decrypt_tuta(group_key, base64.b64decode(enc_sk_b64), remove_padding=False)
                 enc_new_name = aes_encrypt_tuta(item_sk, new_name.encode("utf-8"))
                 enc_new_name_b64 = base64.b64encode(enc_new_name).decode()
             else:
@@ -3784,7 +3784,7 @@ class TutaClient:
             new_name = (rename_map or {}).get(fld.name)
             if new_name:
                 enc_sk_b64 = fld.raw.get("6", "")
-                item_sk = aes_decrypt_tuta(group_key, base64.b64decode(enc_sk_b64))
+                item_sk = aes_decrypt_tuta(group_key, base64.b64decode(enc_sk_b64), remove_padding=False)
                 enc_new_name = aes_encrypt_tuta(item_sk, new_name.encode("utf-8"))
                 enc_new_name_b64 = base64.b64encode(enc_new_name).decode()
             else:

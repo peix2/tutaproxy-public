@@ -1,5 +1,66 @@
 # Changelog
 
+## v1.3.19 — 2026-10-22 — Don't strip PKCS7 from keys (fixes ~1/256 truncated session keys)
+
+Reported in issue #3 (thanks @Zamboni1337 for the precise diagnosis). Symptoms on a live
+account: sporadic `HMAC mismatch` when reading a mail body, empty subjects and sender
+names, and calendar events silently missing. In one mailbox, 35 of 8218 mail session keys
+and 6 of 2257 calendar event session keys were affected — all truncated to exactly 31 bytes.
+`TUTA_SKIP_HMAC=1` did not help (the key itself was wrong, not the integrity check).
+
+### Diagnosis
+
+`aes_decrypt_tuta` always tried to strip PKCS7 padding (`try: unpadder … except: return raw`).
+That is correct for encrypted *values* (strings, dates, body — Tuta encrypts those via
+`encryptBytes` → `PaddingStandard.Pkcs5`), but wrong for *keys*: symmetric AES keys
+(group/session/bucket) are encrypted via `encryptKey`/`decryptKey` → `PaddingStandard.None`,
+i.e. **without** padding.
+
+If a raw 32-byte key happened to end with bytes that look like valid PKCS7 (`…01`, `…02 02`,
+…, ≈ 1 in 256 keys), `unpadder.finalize()` did not raise and silently truncated the key to
+31 bytes (or fewer). Everything decrypted with that key then failed. The other ~255/256 keys
+worked by accident — `finalize()` raised on invalid padding and the fallback returned the raw
+bytes.
+
+Confirmed against the reference client (`platform-kit/crypto/.../SymmetricCipherFacade.ts`):
+- `encryptKey`/`decryptKey` → `PaddingStandard.None` — symmetric keys.
+- `encryptBytes`/`decryptBytes` → `PaddingStandard.Pkcs5` — values, body, **and the private
+  ECC/Kyber/RSA keys** (`encryptX25519Key`/`encryptKyberKey`/`encryptRsaKey` call `aesEncrypt`
+  → `encryptBytes`, so those *are* padded).
+
+### Fix
+
+Added `remove_padding: bool = True` to `aes_decrypt_tuta` (symmetric to the existing
+`add_padding` on `aes_encrypt_tuta`). With `remove_padding=False` the function returns the raw
+decrypted bytes (no unpadding). The default `True` preserves the previous behaviour for values,
+so no value-decoding site needed to change.
+
+`remove_padding=False` is set **only** where a symmetric AES key is decrypted:
+- `crypto.py`: `decrypt_user_group_key` (0x01 branch), `decrypt_mail_group_key`,
+  `decrypt_mail_session_key`, `resolve_bucket_session_key` (groupEncBucketKey +
+  bucketEncSessionKey).
+- `api.py` (17 sites): bucket session key (field 2042), file/folder keys, group keys
+  (mail/calendar/contacts/Drive), contact/calendar-event/Drive-item session keys, Secure
+  External user/mail group keys.
+- `imap_server.py`: PQ bucket session key (field 2042).
+
+**Intentionally left unchanged** (padded data — stays on the default `remove_padding=True`):
+mail body (1276), file data chunks, private ECC/Kyber keys (`symEncPrivEccKey`/
+`symEncPrivKyberKey`), the PQ `kek_enc_bucket_key` (our side encrypts it with padding, per
+`PQFacade`), and all strings/dates/sequences/repeat-rule fields.
+
+The value path keeps its `try unpad / except return raw` fallback: if any key site were
+missed, it behaves as before (latent 1/256) rather than breaking outright — a deliberate
+low-regression-risk choice.
+
+### Test
+
+`test_crypto.py::TestKeyPaddingNoStrip` (5 cases): a 32-byte key ending in `0x01` and
+`0x02 0x02` round-trips intact with `remove_padding=False` (and is truncated in the default
+mode — documenting the bug); a round-trip for **every** possible trailing byte; the
+`decrypt_mail_group_key`/`_session_key` wrappers return the full key; the value path still
+strips PKCS7 correctly.
+
 ## v1.3.18 — 2026-09-21 — Persistent monotonic UID + NOOP reconciliation (fix for invisible mail)
 
 Reported symptom: the Tuta app shows a new mail, but Thunderbird never sees it — not even
